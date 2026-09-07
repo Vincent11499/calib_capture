@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=APP_VERSION)
     parser.add_argument(
         "--config",
-        help="optional YAML configuration; command-line options override it",
+        help="optional INI configuration ([capture], no extra dependency); command-line options override it",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

@@ -8,7 +8,7 @@
 - [项目 Agent 维护规范](../AGENTS.md)：后续 Agent 修改代码时必须遵守的硬件、ABI、数据与测试契约。工程只保留这一份顶层 Agent 文档。
 - [AXERA VIN/ABI 约束](./AXERA_IVPS.md)：VIN 获取、物理映射、完整帧释放和 SDK ABI。
 - [目录数据集格式](./DATASET_FORMAT.md)：文件、CSV、时间戳和 ROS1 bag 映射。
-- [板端验证记录](./BOARD_VALIDATION.md)：v1.5.1 默认 5 Hz、60 秒双目–IMU 实测结果与测试范围。
+- [板端验证记录](./BOARD_VALIDATION.md)：默认 5 Hz、60 秒双目–IMU 实测，以及 v1.6.0 INI 配置回归。
 
 板端部署目标为 `/workspace/minsky/Vincent/calib_capture`；对应宿主机目录是 `/workspace/test/Vincent/calib_capture`。SSH、SCP 和 Docker 进入步骤及授权边界见《使用操作说明》和顶层 `AGENTS.md`。
 
@@ -22,11 +22,7 @@
 
 ## 依赖与部署
 
-以下命令默认从项目顶层执行。安装采集依赖：
-
-```bash
-python3 -m pip install -r script/requirements-capture.txt
-```
+以下命令默认从项目顶层执行。板端使用现有环境，不安装新包或库。INI 配置由 Python 标准库 `configparser` 读取，无需 PyYAML；`script/requirements-capture.txt` 仅列出可选的 NumPy 灰度转换加速依赖。
 
 只有 `camera-imu` 和 `probe --with-imu` 需要先 source 与 IMU 发布端一致的 ROS 2 环境；纯双目采集、校验和 bag 导出不依赖 ROS 2：
 
@@ -44,7 +40,7 @@ source /opt/ros/humble/setup.bash
 | vis | VIN | pipe 2 / chn 0 | pipe 0 / chn 0 | `AX_VIN_GetYuvFrame` | NV12，3840×2160 |
 | vis | IVPS | grp 7 / chn 0 | grp 8 / chn 0 | `AX_IVPS_GetChnFrame` | 灰度，640×384 |
 
-本采集工具的录制命令使用表中 cali VIN 路径。vis 两套输出记录在 `default_config.yaml` 的 `hardware_layout` 中，供联调和避免接错通道；不会被标定录制命令误用。
+本采集工具的录制命令使用表中 cali VIN 路径。cali/vis 接线清单记录在 `script/default_config.ini` 顶端注释中，供联调和避免接错通道；不会被标定录制命令误用，也不是可加载的配置段。
 
 ROS1 bag 只在 PC 本机离线导出，不在板端安装 `rosbags` 或执行转换：
 
@@ -92,7 +88,7 @@ python3 script/calibration_data.py stereo-continuous \
   --duration-s 60 --save-rate-hz 5
 ```
 
-默认 `--save-rate-hz 5` 按传感器 PTS 每约 200 ms 保存一对；该参数可省略。也可显式使用 `--frame-divisor N`，在左右源序号都至少前进 N 后保存一对。两种策略互斥，命令行策略覆盖 YAML；YAML 同一层不能同时设置正数 `frame_divisor` 和 `save_rate_hz`。
+默认 `--save-rate-hz 5` 按传感器 PTS 每约 200 ms 保存一对；该参数可省略。也可显式使用 `--frame-divisor N`，在左右源序号都至少前进 N 后保存一对。两种策略互斥，命令行策略覆盖 INI 配置；INI 的 `[capture]` 中不能同时设置正数 `frame_divisor` 和 `save_rate_hz`。
 
 双目–IMU采集：
 
@@ -119,15 +115,19 @@ python3 script/calibration_data.py export-ros1 \
 录制、结束收尾、校验与导出均不计算数据文件 SHA-256。导出前检查 BMP 格式/尺寸、CSV 配对与时间戳；导出后再打开 bag，逐话题核对消息类型、数量、首尾时间戳、单调性以及 Header stamp 与 bag record time 是否完全相同。实现基于 [rosbags 0.11 ROS1 Writer](https://ternaris.gitlab.io/rosbags/topics/rosbag1.html)。
 只有诊断损坏数据时才使用 `--force-dataset`；默认情况下任何硬校验错误都会阻止交付 bag。
 
-## YAML 配置
+## INI 配置
 
-模板为 `script/default_config.yaml`。`--config` 必须放在子命令前，命令行参数优先于 YAML：
+模板为 `script/default_config.ini`，使用 Python 标准库 `configparser`，无需额外依赖。`--config` 必须放在子命令前，配置优先级为“命令行 > INI `[capture]` > 内置默认值”：
 
 ```bash
-python3 script/calibration_data.py --config script/default_config.yaml camera-imu \
+python3 script/calibration_data.py --config script/default_config.ini camera-imu \
   --output ./data \
   --resolution 1920x1080
 ```
+
+不写 `--config` 时不会自动读取模板。文件使用 UTF-8（可带 BOM），只允许 `[capture]` 段；值不加引号，注释单独以 `;` 或 `#` 起行。不支持 `[DEFAULT]` 参数、其他段、重复键或未知键；不做插值，`%`、`${...}` 保留字面值。旧自定义 YAML/JSON 需转换内容，不能只改扩展名。
+
+采集输出的 `dataset.yaml` 和 JSON 元数据是独立的数据契约，保留原格式；`dataset.yaml` 写入与校验也不依赖 PyYAML。
 
 ## 结果状态
 

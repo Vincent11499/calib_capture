@@ -2,6 +2,8 @@
 
 目录数据集是唯一原始数据。ROS1 bag 是可重复生成的派生文件。
 
+运行配置使用 `--config` 指定的 INI 文件，与本页的数据集契约相互独立。输出中的 `dataset.yaml` 和 JSON 元数据保留原格式；`dataset.yaml` 写入与校验不依赖 PyYAML。
+
 录制命令把 `--output` 作为根目录，默认使用 `./data`；每次会话的数据集目录为 `<output>/YYYY-MM-DD_HH-MM-SS/`。以下结构均位于该时间戳目录内：
 
 ```text

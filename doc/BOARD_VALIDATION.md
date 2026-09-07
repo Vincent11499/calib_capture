@@ -58,3 +58,31 @@ python3 -B script/calibration_data.py probe --with-imu --samples 50
 - 未切换上游分辨率，1080p 实采未复测；未执行 PC ROS1 bag 回读或 Kalibr 加载验收。本次未安装这些可选依赖。
 
 本记录及其他文档仅保留在 PC/Git；测试数据保留在板端工作区，不纳入 Git。
+
+## INI 配置迁移补充：2026-09-07 / v1.6.0
+
+运行配置改为 `script/default_config.ini`，使用 Python 标准库 `configparser`，不再直接依赖 PyYAML。数据集格式及采集、写盘逻辑不变。
+
+- PC 自检：53 项，51 通过、2 项 rosbags 跳过；SDK 头文件契约通过。
+- 板端使用 `python3 -S -B script/calibration_data.py self-test` 禁用第三方 site-packages 后，53 项中 51 通过、2 项 rosbags 跳过。
+- 默认 INI 构建的配置与不传 `--config` 的内置配置完全一致。INI/BOM、注释、字面值、CLI 优先级、Hz/分频互斥及非法配置拒绝均有测试覆盖。
+- 仅同步相关脚本、INI 模板、测试及采集依赖清单；没有安装任何包、库，没有同步文档或数据。板端旧 YAML/JSON 模板改名为 `default_config.yaml.legacy`、`default_config.json.legacy` 留作迁移参考，不再读取。
+
+在前述板端环境下执行：
+
+```bash
+python3 -B script/calibration_data.py --config script/default_config.ini probe --with-imu --samples 50
+python3 -B script/calibration_data.py --config script/default_config.ini camera-imu --duration-s 5
+```
+
+INI `probe` 通过：NV12 3840×2160，左右源频率均为 50 Hz，最大双目差 4 µs，IMU 99.859750 Hz，无 AX 错误。
+
+短时实采输出为 `/workspace/minsky/Vincent/calib_capture/data/2026-09-07_18-40-21`：
+
+- 左右各 26 张，实际保存频率约 5 Hz；IMU 共 507 条，99.810108 Hz，无长间隔。
+- 最大双目时间差 5 µs，写盘队列丢对 0，AX 返回错误 0。
+- 平均每对写入 140.979 ms，最大 251.018 ms。
+- 会话配置确认 `duration_s = 5` 覆盖 INI 中的 60 秒；`save_rate_hz = 5`、`frame_divisor = 0` 保持不变。
+- 结构与时序检查无硬错误；状态为 `warning`，原因仍为板端无 SDK 头文件及源序号缺口（左右各 10）。
+
+同时只读重验上面的 v1.5.1 一分钟数据，仍无硬错误。本次只改配置入口，执行了 5 秒端到端回归，未重复一分钟录制；1080p 实采、ROS1 bag 回读和 Kalibr 加载未新增测试。

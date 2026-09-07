@@ -1,5 +1,4 @@
 numpy>=1.26,<3
-PyYAML>=6,<7
 rosbags==0.11.0
 lz4>=4.3
 zstandard>=0.22

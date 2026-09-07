@@ -73,7 +73,9 @@
 
 ## 配置和数据规则
 
-- 配置优先级：命令行 > YAML > 内置默认值。
+- 配置优先级：命令行 > INI `[capture]` 配置 > 内置默认值。`--config` 使用 Python 标准库 `configparser` 读取 UTF-8（可带 BOM）文件，不依赖 PyYAML；模板为 `script/default_config.ini`，未指定 `--config` 时不自动加载。
+- INI 只允许 `[capture]` 段，不接受 `[DEFAULT]` 参数、其他段、重复键或未知键。值不加引号；注释单独以 `;` 或 `#` 起行。关闭插值，`%`、`${...}` 按字面处理。cali/vis 硬件清单只记录在模板顶端注释中，不设置 `hardware_layout` 段。
+- 旧的自定义 YAML/JSON 配置需转换内容，不能只改扩展名。目录数据契约中的 `dataset.yaml` 和 JSON 元数据保持不变；`dataset.yaml` 写入与校验不依赖 PyYAML。
 - 新配置项必须同步修改默认配置、数据类、CLI、会话元数据、文档和测试。
 - 不得静默改变左右目含义、时间单位、目录 schema 或默认话题。
 - 当前数据集为 schema 2，标记 `data_integrity: structural`；读取时兼容 schema 1，忽略旧数据的校验和清单。同长度像素变化不再由校验器检测。
@@ -118,4 +120,4 @@ export ROS_DOMAIN_ID=83
 source /opt/ros/humble/setup.bash
 ```
 
-宿主机 `/workspace/test/Vincent` 映射到容器 `/workspace/minsky/Vincent`。板端只同步 `script/`；不要同步 `doc/`、顶层 `AGENTS.md`、`data/` 或 `tmp/`，也不要向容器映射路径重复复制。ROS1 bag 导出和 `rosbags` 依赖只在 PC 本机使用。
+宿主机 `/workspace/test/Vincent` 映射到容器 `/workspace/minsky/Vincent`。板端只同步 `script/`；不要同步 `doc/`、顶层 `AGENTS.md`、`data/` 或 `tmp/`，也不要向容器映射路径重复复制。板端使用现有环境，不安装新包或库；`requirements-capture.txt` 中的 NumPy 仅用于可选加速。ROS1 bag 导出和 `rosbags` 依赖只在 PC 本机使用。

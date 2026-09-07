@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import math
 import os
 from dataclasses import asdict, dataclass
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 DATASET_SCHEMA_VERSION = 2
 NS_PER_SECOND = 1_000_000_000
 SESSION_DIRECTORY_FORMAT = "%Y-%m-%d_%H-%M-%S"
@@ -103,32 +104,45 @@ def detect_sdk_include_dir(explicit: str = "") -> str:
     return ""
 
 
-def load_yaml_mapping(path: str | Path | None) -> dict[str, Any]:
+def load_ini_mapping(path: str | Path | None) -> dict[str, str]:
+    """Read literal values from [capture]; build_capture_config converts types."""
     if not path:
         return {}
     config_path = Path(path).expanduser()
+    if config_path.suffix.lower() != ".ini":
+        raise ValueError(
+            "--config requires an .ini file with [capture]; convert old YAML/JSON to INI "
+            "instead of only renaming the file"
+        )
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        delimiters=("=",),
+        strict=True,
+        empty_lines_in_values=False,
+    )
+    # Keep misspelled/case-mismatched keys visible instead of normalizing them.
+    parser.optionxform = str
     try:
-        import yaml
-    except ImportError as exc:
-        raise RuntimeError(
-            "PyYAML is required when --config is used; install "
-            "script/requirements-capture.txt from the project root"
-        ) from exc
-    with config_path.open("r", encoding="utf-8") as stream:
-        value = yaml.safe_load(stream)
-    if value is None:
-        return {}
-    if not isinstance(value, Mapping):
-        raise ValueError(f"configuration root must be a mapping: {config_path}")
-    if "capture" in value:
-        capture = value["capture"]
-        if not isinstance(capture, Mapping):
-            raise ValueError("config.capture must be a mapping")
-        value = capture
-    unknown = sorted(set(value) - set(DEFAULTS))
+        # utf-8-sig accepts both plain UTF-8 and Windows editors' UTF-8 BOM.
+        with config_path.open("r", encoding="utf-8-sig") as stream:
+            parser.read_file(stream)
+    except configparser.Error as exc:
+        raise ValueError(f"invalid INI configuration {config_path}: {exc}") from exc
+    if parser.defaults():
+        raise ValueError("INI [DEFAULT] settings are not supported; use [capture]")
+    if not parser.has_section("capture"):
+        raise ValueError("INI configuration requires a [capture] section")
+    unknown_sections = sorted(set(parser.sections()) - {"capture"})
+    if unknown_sections:
+        raise ValueError("unknown configuration sections: " + ", ".join(unknown_sections))
+    values = dict(parser.items("capture"))
+    unknown = sorted(set(values) - set(DEFAULTS))
     if unknown:
         raise ValueError("unknown configuration keys: " + ", ".join(unknown))
-    return dict(value)
+    for key, value in values.items():
+        if "\n" in value:
+            raise ValueError(f"INI value must be on one line: {key}")
+    return values
 
 
 @dataclass(frozen=True)
@@ -186,7 +200,7 @@ def build_capture_config(
     config_path: str | None = None,
     overrides: Mapping[str, Any] | None = None,
 ) -> CaptureConfig:
-    yaml_values = load_yaml_mapping(config_path)
+    file_values = load_ini_mapping(config_path)
     override_values = {
         key: value
         for key, value in (overrides or {}).items()
@@ -198,18 +212,18 @@ def build_capture_config(
     ):
         raise ValueError("save_rate_hz and frame_divisor are mutually exclusive")
     if (
-        "save_rate_hz" in yaml_values
-        and int(yaml_values.get("frame_divisor", 0)) > 0
+        "save_rate_hz" in file_values
+        and int(file_values.get("frame_divisor", 0)) > 0
         and "save_rate_hz" not in override_values
         and "frame_divisor" not in override_values
     ):
         raise ValueError(
-            "YAML save_rate_hz and frame_divisor are mutually exclusive; choose one"
+            "INI save_rate_hz and frame_divisor are mutually exclusive; choose one"
         )
     values = dict(DEFAULTS)
-    values.update(yaml_values)
+    values.update(file_values)
     # Selecting a save rate at the higher-priority layer disables a divisor
-    # inherited from YAML. Selecting a divisor naturally makes save_rate_hz
+    # inherited from INI. Selecting a divisor naturally makes save_rate_hz
     # inactive while retaining it as the fallback for frame_divisor=0.
     if "save_rate_hz" in override_values:
         values["frame_divisor"] = 0

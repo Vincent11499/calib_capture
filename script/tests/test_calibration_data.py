@@ -34,7 +34,12 @@ from calib_capture.axera import (
 from calib_capture.bmp import BMP_PIXEL_OFFSET, read_mono8_bmp, write_mono8_bmp
 from calib_capture.capture import FrameDivider, ImuSubscriber, PairDiskWriter, RateLimiter
 from calib_capture.cli import _capture_config, build_parser
-from calib_capture.config import build_capture_config, session_output_path
+from calib_capture.config import (
+    DEFAULTS,
+    build_capture_config,
+    load_ini_mapping,
+    session_output_path,
+)
 from calib_capture.dataset import DatasetWriter, ImuRecord
 from calib_capture.ros1_export import export_ros1_bag
 from calib_capture.validator import validate_dataset
@@ -322,15 +327,140 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(config.frame_divisor, 0)
                 self.assertEqual(config.imu_expected_rate_hz, 100.0)
 
-    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
-    def test_cli_overrides_yaml_and_yaml_overrides_defaults(self) -> None:
+    def test_default_ini_matches_builtin_defaults(self) -> None:
+        path = Path(__file__).resolve().parents[1] / "default_config.ini"
+        self.assertEqual(set(load_ini_mapping(path)), set(DEFAULTS))
+        self.assertEqual(
+            build_capture_config(mode="camera-imu", config_path=str(path)),
+            build_capture_config(mode="camera-imu"),
+        )
+
+    def test_ini_accepts_comments_and_utf8_bom(self) -> None:
+        document = (
+            "; stereo settings\n"
+            "[capture]\n"
+            "# full resolution VIN\n"
+            "left_pipe = 4\n"
+            "left_frame_id = 左目\n"
+        )
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "capture.yaml"
+            path = Path(raw) / "capture.ini"
+            for encoding in ("utf-8", "utf-8-sig"):
+                with self.subTest(encoding=encoding):
+                    path.write_text(document, encoding=encoding)
+                    self.assertEqual(
+                        load_ini_mapping(path),
+                        {"left_pipe": "4", "left_frame_id": "左目"},
+                    )
+
+    def test_ini_preserves_literal_values_without_interpolation(self) -> None:
+        value = "left%100/${camera} # still literal;also literal"
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
             path.write_text(
-                "capture:\n"
-                "  left_pipe: 4\n"
-                "  resolution: 1920x1080\n"
-                "  save_rate_hz: 7.5\n",
+                f"[capture]\nleft_frame_id = {value}\n", encoding="utf-8"
+            )
+            self.assertEqual(load_ini_mapping(path), {"left_frame_id": value})
+            config = build_capture_config(mode="probe", config_path=str(path))
+            self.assertEqual(config.left_frame_id, value)
+
+    def test_ini_empty_capture_and_no_config_use_defaults(self) -> None:
+        self.assertEqual(load_ini_mapping(None), {})
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            for document in ("[capture]\n", "[DEFAULT]\n[capture]\n"):
+                with self.subTest(document=document):
+                    path.write_text(document, encoding="utf-8")
+                    self.assertEqual(
+                        build_capture_config(mode="probe", config_path=str(path)),
+                        build_capture_config(mode="probe"),
+                    )
+
+    def test_ini_rejects_missing_capture_and_malformed_content(self) -> None:
+        documents = (
+            "",
+            "; comments only\n",
+            "left_pipe = 4\n",
+            "[capture\nleft_pipe = 4\n",
+            "[capture]\nleft_pipe\n",
+            "[capture]\nleft_pipe: 4\n",
+            "[capture]\nleft_frame_id = left\n  continued\n",
+            "[DEFAULT]\n",
+            "[Capture]\nleft_pipe = 4\n",
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            for document in documents:
+                with self.subTest(document=document):
+                    path.write_text(document, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_ini_mapping(path)
+
+    def test_ini_rejects_unknown_or_wrong_case_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            for key in ("save_rate", "Left_pipe", "LEFT_PIPE"):
+                with self.subTest(key=key):
+                    path.write_text(f"[capture]\n{key} = 4\n", encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "unknown configuration"):
+                        load_ini_mapping(path)
+
+    def test_ini_rejects_extra_sections_and_default_inheritance(self) -> None:
+        documents = (
+            "[capture]\n[hardware_layout]\n",
+            "[capture]\n[other]\nleft_pipe = 4\n",
+            "[DEFAULT]\nleft_pipe = 4\n[capture]\n",
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            for document in documents:
+                with self.subTest(document=document):
+                    path.write_text(document, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_ini_mapping(path)
+
+    def test_ini_rejects_duplicate_keys_and_sections(self) -> None:
+        documents = (
+            "[capture]\nleft_pipe = 2\nleft_pipe = 4\n",
+            "[capture]\n[capture]\n",
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            for document in documents:
+                with self.subTest(document=document):
+                    path.write_text(document, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_ini_mapping(path)
+
+    def test_ini_numeric_values_are_validated_after_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            for value in ("0", "-1", "NaN", "Infinity", "-Infinity", "fast"):
+                with self.subTest(value=value):
+                    path.write_text(
+                        f"[capture]\nsave_rate_hz = {value}\n", encoding="utf-8"
+                    )
+                    self.assertEqual(load_ini_mapping(path), {"save_rate_hz": value})
+                    with self.assertRaises(ValueError):
+                        build_capture_config(mode="camera-imu", config_path=str(path))
+
+    def test_old_config_extensions_explain_ini_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            for suffix in (".yaml", ".yml", ".json", ".YAML", ".JSON"):
+                with self.subTest(suffix=suffix):
+                    path = Path(raw) / ("capture" + suffix)
+                    path.write_text("[capture]\nleft_pipe = 4\n", encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "INI"):
+                        load_ini_mapping(path)
+
+    def test_cli_overrides_ini_and_ini_overrides_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            path.write_text(
+                "[capture]\n"
+                "left_pipe = 4\n"
+                "resolution = 1920x1080\n"
+                "save_rate_hz = 7.5\n",
                 encoding="utf-8",
             )
             config = build_capture_config(
@@ -358,17 +488,32 @@ class ConfigTests(unittest.TestCase):
                 overrides={"save_rate_hz": 7.5, "frame_divisor": 5},
             )
 
-    @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
-    def test_cli_save_rate_disables_yaml_frame_divisor(self) -> None:
+    def test_cli_rate_strategy_overrides_ini(self) -> None:
+        cases = (
+            ("frame_divisor = 3", ["--save-rate-hz", "7"], 0, 7.0),
+            ("save_rate_hz = 7", ["--frame-divisor", "5"], 5, 10.0),
+        )
         with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "capture.yaml"
-            path.write_text("capture:\n  frame_divisor: 3\n", encoding="utf-8")
-            args = build_parser().parse_args(
-                ["--config", str(path), "stereo-continuous", "--save-rate-hz", "7"]
+            path = Path(raw) / "capture.ini"
+            for values, arguments, divisor, rate_hz in cases:
+                with self.subTest(values=values, arguments=arguments):
+                    path.write_text(f"[capture]\n{values}\n", encoding="utf-8")
+                    args = build_parser().parse_args(
+                        ["--config", str(path), "stereo-continuous", *arguments]
+                    )
+                    config = _capture_config(args, "stereo-continuous")
+                    self.assertEqual(config.frame_divisor, divisor)
+                    self.assertEqual(config.target_save_rate_hz, rate_hz)
+
+    def test_ini_rate_controls_are_rejected_together(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            path.write_text(
+                "[capture]\nsave_rate_hz = 7.5\nframe_divisor = 3\n",
+                encoding="utf-8",
             )
-            config = _capture_config(args, "stereo-continuous")
-            self.assertEqual(config.frame_divisor, 0)
-            self.assertEqual(config.target_save_rate_hz, 7.0)
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                build_capture_config(mode="camera-imu", config_path=str(path))
 
     def test_session_output_uses_timestamp_subdirectory(self) -> None:
         path = session_output_path(

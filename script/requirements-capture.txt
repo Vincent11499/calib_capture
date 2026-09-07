@@ -1,4 +1,4 @@
+# INI configuration uses standard-library configparser; no parser install needed.
 # rclpy and sensor_msgs are supplied by the sourced ROS 2 installation.
+# Optional grayscale conversion acceleration; use existing board packages.
 numpy>=1.24,<3
-PyYAML>=6,<7
-
