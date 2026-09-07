@@ -1,0 +1,8 @@
+# Keep source and documentation portable between Windows and the Linux board.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.bmp binary
+*.bag binary
+*.db3 binary
+*.mcap binary

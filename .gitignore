@@ -1,0 +1,53 @@
+# Capture datasets and local reference / temporary files (at any depth).
+data/
+tmp/
+temp/
+output/
+*.inprogress/
+*.failed/
+*.bag
+*.bag.active
+*.bag.inprogress
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+*.bmp
+
+# Python environments, caches and build products.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local credentials and machine-specific configuration.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Editor, OS and runtime temporary files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+*.tmp
+*.swp
+*.swo
+*~

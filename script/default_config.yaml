@@ -1,0 +1,53 @@
+# Wiring inventory. Capture commands use the cali VIN mapping below. The vis
+# outputs are documented here so the two product modes cannot be confused.
+hardware_layout:
+  cali:
+    vin:
+      api: AX_VIN_GetYuvFrame
+      pixel_format: NV12
+      resolution: config
+      left: {pipe: 2, chn: 0}
+      right: {pipe: 0, chn: 0}
+  vis:
+    vin:
+      api: AX_VIN_GetYuvFrame
+      pixel_format: NV12
+      resolution: 3840x2160
+      left: {pipe: 2, chn: 0}
+      right: {pipe: 0, chn: 0}
+    ivps:
+      api: AX_IVPS_GetChnFrame
+      pixel_format: YUV400
+      resolution: 640x384
+      left: {grp: 7, chn: 0}
+      right: {grp: 8, chn: 0}
+
+capture:
+  ax_lib_dir: /soc/lib
+  sdk_include_dir: ""
+  left_pipe: 2
+  left_chn: 0
+  right_pipe: 0
+  right_chn: 0
+  resolution: 3840x2160
+  expected_source_rate_hz: 50.0
+  # 0: use save_rate_hz. N>0: save one synchronized pair every N source pairs.
+  # At a 20 ms source period, 3 is about 60 ms and 5 is about 100 ms.
+  frame_divisor: 0
+  save_rate_hz: 10.0
+  duration_s: 60.0
+  poses: 20
+  sync_tolerance_us: 2000
+  max_sync_retries: 10
+  capture_timeout_ms: 200
+  writer_queue_pairs: 2
+  startup_timeout_s: 15.0
+  imu_topic: /imu/data
+  imu_expected_rate_hz: 100.0
+  imu_qos_depth: 2000
+  clock_domain_max_offset_s: 5.0
+  left_topic: /stereo/left/image_raw
+  right_topic: /stereo/right/image_raw
+  left_frame_id: cam0
+  right_frame_id: cam1
+  imu_frame_id: imu0
