@@ -36,13 +36,15 @@
 - `cam0` 始终是左目，`cam1` 始终是右目。
 - 默认左目 pipe 2/chn 0、右目 pipe 0/chn 0，CLI 可显式覆盖。
 - 标定输入必须为 NV12，落盘图像为无损 `mono8` BMP。
+- 数据文件不计算 SHA-256，录制、结束收尾、离线校验和 bag 导出都只做结构与时序检查。BMP 按原 bottom-up 布局大块写入；不生成 `meta/checksums.sha256`。SDK 启动契约哈希不属于逐帧数据处理，仍保留。
 - 使用 `u64PhyAddr[0]` 调用 `AX_SYS_MmapCache`；缓存失效后复制 Y 平面到 Python 内存，再立即 Munmap 并释放 SDK 帧。不得解引用其他进程的 `u64VirAddr`。
 - `AX_VIN_GetYuvFrame` 获取完整 `AX_IMG_INFO_T`，必须把同一个对象交回原 pipe/chn 的 `AX_VIN_ReleaseYuvFrame`。每个成功获取的帧只释放一次。
 - 左右 PTS 差默认不超过 2000 µs；超限时仅重取较早侧，最多 10 次。
 - 相机时间戳使用各自 `u64PTS × 1000` ns；IMU 使用原始 `header.stamp`。
 - 相机与 IMU 首帧差超过 5 秒时拒绝 `camera-imu` 录制。
 - 连续采集按完整双目对限频、分频和入队；任何丢弃都必须同时丢弃左右目。
-- `--save-rate-hz` 与 `--frame-divisor N` 仅用于连续双目和 `camera-imu`，两者互斥：前者按 PTS 控制目标保存频率，后者在左右 AX 源序号都至少前进 N 后保存一对。未指定时默认按 PTS 保存 10 Hz。IMU 不分频。
+- `--save-rate-hz` 与 `--frame-divisor N` 仅用于连续双目和 `camera-imu`，两者互斥。默认按 PTS 保存双目 5 Hz（约 200 ms 一对）；可显式使用源序号分频。IMU 收到的消息全部保存。
+- PTS 限频以首对时间锚定目标时刻，选择到达目标的第一对，避免周期舍入累计导致边界多跳一帧。
 - 采集先写 `.inprogress`，成功校验后提交正式目录；失败时保留为 `.failed`。
 
 ## 输出目录
@@ -74,6 +76,8 @@
 - 配置优先级：命令行 > YAML > 内置默认值。
 - 新配置项必须同步修改默认配置、数据类、CLI、会话元数据、文档和测试。
 - 不得静默改变左右目含义、时间单位、目录 schema 或默认话题。
+- 当前数据集为 schema 2，标记 `data_integrity: structural`；读取时兼容 schema 1，忽略旧数据的校验和清单。同长度像素变化不再由校验器检测。
+- `meta/session.json` 的 `write_performance` 记录每对 BMP 与 CSV 提交的平均、最大及累计耗时；不包括取帧、排队等待或 `fsync`。
 - 仅 `camera-imu` 和 `probe --with-imu` 可以依赖 ROS 2 Python 环境。
 - 写盘队列满时只丢弃完整双目对，并记录 AX 错误、源序号缺口、分频/限频跳过数及队列丢弃数。
 - 不做磁盘容量或写速硬准入；4K 数据量只提示。

@@ -34,7 +34,8 @@ capture:
   # 0: use save_rate_hz. N>0: save one synchronized pair every N source pairs.
   # At a 20 ms source period, 3 is about 60 ms and 5 is about 100 ms.
   frame_divisor: 0
-  save_rate_hz: 10.0
+  # Stereo pairs only; every received IMU message is saved independently.
+  save_rate_hz: 5.0
   duration_s: 60.0
   poses: 20
   sync_tolerance_us: 2000

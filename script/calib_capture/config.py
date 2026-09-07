@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.1"
+DATASET_SCHEMA_VERSION = 2
 NS_PER_SECOND = 1_000_000_000
 SESSION_DIRECTORY_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
@@ -37,7 +38,7 @@ DEFAULTS: dict[str, Any] = {
     "right_chn": 0,
     "resolution": "3840x2160",
     "expected_source_rate_hz": 50.0,
-    "save_rate_hz": 10.0,
+    "save_rate_hz": 5.0,
     "frame_divisor": 0,
     "duration_s": 60.0,
     "poses": 20,

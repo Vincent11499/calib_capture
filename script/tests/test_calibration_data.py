@@ -31,8 +31,8 @@ from calib_capture.axera import (
     packed_frame_to_gray,
     validate_frame_metadata,
 )
-from calib_capture.bmp import read_mono8_bmp, write_mono8_bmp
-from calib_capture.capture import FrameDivider, PairDiskWriter, RateLimiter
+from calib_capture.bmp import BMP_PIXEL_OFFSET, read_mono8_bmp, write_mono8_bmp
+from calib_capture.capture import FrameDivider, ImuSubscriber, PairDiskWriter, RateLimiter
 from calib_capture.cli import _capture_config, build_parser
 from calib_capture.config import build_capture_config, session_output_path
 from calib_capture.dataset import DatasetWriter, ImuRecord
@@ -134,7 +134,7 @@ def create_dataset(root: Path, mode: str = "camera-imu") -> Path:
     session = writer.seal_payload(
         {"mode": mode, "capture_status": "completed", "capture_stats": {}}
     )
-    report = validate_dataset(writer.staging_path, verify_checksums=True)
+    report = validate_dataset(writer.staging_path)
     session["validation_status"] = report.status
     writer.write_session(session)
     return writer.commit(not report.errors)
@@ -149,6 +149,23 @@ class BmpTests(unittest.TestCase):
             info, decoded = read_mono8_bmp(path)
             self.assertEqual((info.width, info.height, info.row_stride), (7, 3, 8))
             self.assertEqual(decoded, pixels)
+
+    def test_large_block_write_preserves_bottom_up_bytes_without_hashing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            for width in (4, 7, 1920, 3840):
+                with self.subTest(width=width):
+                    path = Path(raw) / f"{width}.bmp"
+                    height = 3
+                    pixels = bytes(value % 256 for value in range(width * height))
+                    with mock.patch("hashlib.sha256", side_effect=AssertionError("unexpected hash")):
+                        self.assertIsNone(write_mono8_bmp(path, width, height, pixels))
+                    padding = bytes((-width) % 4)
+                    expected = b"".join(
+                        pixels[row * width:(row + 1) * width] + padding
+                        for row in range(height - 1, -1, -1)
+                    )
+                    self.assertEqual(path.read_bytes()[BMP_PIXEL_OFFSET:], expected)
+                    self.assertEqual(read_mono8_bmp(path)[1], pixels)
 
     def test_all_supported_formats_convert_to_gray(self) -> None:
         y_plane = bytes((1, 2, 3, 99, 4, 5, 6, 99))
@@ -293,7 +310,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((config.right_pipe, config.right_chn), (0, 0))
         self.assertEqual(config.resolution, (3840, 2160))
         self.assertEqual(config.frame_divisor, 0)
-        self.assertEqual(config.target_save_rate_hz, 10.0)
+        self.assertEqual(config.target_save_rate_hz, 5.0)
+
+    def test_continuous_cli_defaults_to_five_hz_stereo(self) -> None:
+        for command in ("stereo-continuous", "camera-imu"):
+            with self.subTest(command=command):
+                args = build_parser().parse_args([command])
+                config = _capture_config(args, command)
+                self.assertEqual(config.save_rate_hz, 5.0)
+                self.assertEqual(config.target_save_rate_hz, 5.0)
+                self.assertEqual(config.frame_divisor, 0)
+                self.assertEqual(config.imu_expected_rate_hz, 100.0)
 
     @unittest.skipUnless(importlib.util.find_spec("yaml"), "PyYAML is not installed")
     def test_cli_overrides_yaml_and_yaml_overrides_defaults(self) -> None:
@@ -509,6 +536,32 @@ class QueueTests(unittest.TestCase):
         values = [0, 50_000_000, 100_000_000, 150_000_000, 200_000_000]
         self.assertEqual([limiter.accept(value) for value in values], [True, False, True, False, True])
 
+    def test_six_hz_selects_first_source_frame_at_each_exact_deadline(self) -> None:
+        # 50 Hz input alternates 180/160/160 ms gaps without accumulating rounding.
+        expected_ms = [0, 180, 340, 500, 680, 840, 1000]
+        for origin_ns in (0, 1_789_000_000_000_000_001):
+            with self.subTest(origin_ns=origin_ns):
+                limiter = RateLimiter(6.0)
+                selected_ms = [
+                    elapsed_ms
+                    for elapsed_ms in range(0, 1001, 20)
+                    if limiter.accept(origin_ns + elapsed_ms * 1_000_000)
+                ]
+                self.assertEqual(selected_ms, expected_ms)
+
+    def test_rate_limiter_skips_elapsed_deadlines_after_source_gap(self) -> None:
+        limiter = RateLimiter(5.0)
+        source_ms = [0, 20, 1050, 1070, 1090, 1199, 1200, 1220, 1400]
+        selected_ms = [
+            value for value in source_ms if limiter.accept(value * 1_000_000)
+        ]
+        self.assertEqual(selected_ms, [0, 1050, 1200, 1400])
+
+    def test_rate_limiter_rejects_nonpositive_and_nonfinite_rates(self) -> None:
+        for rate_hz in (0.0, -1.0, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(rate_hz=rate_hz), self.assertRaises(ValueError):
+                RateLimiter(rate_hz)
+
     def test_frame_divider_accepts_one_pair_out_of_n(self) -> None:
         divider = FrameDivider(3)
         self.assertEqual(
@@ -528,6 +581,15 @@ class QueueTests(unittest.TestCase):
             FrameDivider(0)
 
 
+class ImuSubscriberTests(unittest.TestCase):
+    def test_stop_reports_last_callback_failure(self) -> None:
+        subscriber = ImuSubscriber(build_capture_config(mode="camera-imu"))
+        subscriber.error = ValueError("late callback")
+        with self.assertRaisesRegex(RuntimeError, "late callback"):
+            subscriber.stop()
+        self.assertTrue(subscriber.stop_event.is_set())
+
+
 class DatasetTests(unittest.TestCase):
     def test_existing_failed_timestamp_directory_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -540,18 +602,27 @@ class DatasetTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 DatasetWriter(output, config, include_imu=False)
 
-    def test_dataset_validates_with_full_checksums(self) -> None:
+    def test_dataset_validates_without_payload_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            dataset = create_dataset(Path(raw))
-            report = validate_dataset(dataset, verify_checksums=True)
+            with mock.patch("hashlib.sha256", side_effect=AssertionError("unexpected hash")):
+                dataset = create_dataset(Path(raw))
+                report = validate_dataset(dataset)
             self.assertFalse(report.errors)
+            self.assertFalse((dataset / "meta/checksums.sha256").exists())
+            self.assertEqual(report.stats["data_integrity"], "structural")
+            self.assertFalse(report.stats["checksums_verified"])
             self.assertEqual(report.stats["cam0_count"], 2)
             self.assertEqual(report.stats["imu_count"], 12)
             contract = (dataset / "dataset.yaml").read_text(encoding="utf-8")
+            self.assertIn("schema_version: 2", contract)
+            self.assertIn("data_integrity: structural", contract)
             self.assertIn("capture_api: AX_VIN_GetYuvFrame", contract)
             self.assertIn("vin: {pipe: 2, chn: 0}", contract)
             self.assertIn("vin: {pipe: 0, chn: 0}", contract)
             self.assertNotIn("ivps:", contract)
+            performance = json.loads((dataset / "meta/session.json").read_text(encoding="utf-8"))["write_performance"]
+            self.assertEqual(performance["pair_count"], 2)
+            self.assertGreaterEqual(performance["max_pair_ms"], performance["mean_pair_ms"])
 
     def test_missing_one_camera_image_is_hard_failure(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -561,16 +632,48 @@ class DatasetTests(unittest.TestCase):
             report = validate_dataset(dataset)
             self.assertTrue(any("missing image" in error for error in report.errors))
 
-    def test_checksum_verification_detects_pixel_corruption(self) -> None:
+    def test_structural_validation_accepts_same_size_pixel_change(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             dataset = create_dataset(Path(raw))
             row = next(csv_row(dataset / "cameras/cam0/timestamps.csv"))
             image = dataset / "cameras/cam0" / row["filename"]
             content = bytearray(image.read_bytes())
-            content[-1] ^= 0x01
+            content[BMP_PIXEL_OFFSET] ^= 0x01
             image.write_bytes(content)
-            report = validate_dataset(dataset, verify_checksums=True)
-            self.assertTrue(any("checksum mismatch" in error for error in report.errors))
+            report = validate_dataset(dataset)
+            self.assertFalse(report.errors)
+            self.assertFalse(report.stats["checksums_verified"])
+
+    def test_structural_validation_still_rejects_truncated_image(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dataset = create_dataset(Path(raw))
+            row = next(csv_row(dataset / "cameras/cam0/timestamps.csv"))
+            image = dataset / "cameras/cam0" / row["filename"]
+            image.write_bytes(image.read_bytes()[:-1])
+            report = validate_dataset(dataset)
+            self.assertTrue(any("invalid image" in error for error in report.errors))
+
+    def test_legacy_dataset_is_readable_without_using_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            dataset = create_dataset(Path(raw))
+            session_path = dataset / "meta/session.json"
+            session = json.loads(session_path.read_text(encoding="utf-8"))
+            session["schema_version"] = 1
+            session.pop("data_integrity")
+            session_path.write_text(json.dumps(session), encoding="utf-8")
+            contract_path = dataset / "dataset.yaml"
+            contract_path.write_text(
+                contract_path.read_text(encoding="utf-8")
+                .replace("schema_version: 2", "schema_version: 1")
+                .replace("data_integrity: structural\n", ""),
+                encoding="utf-8",
+            )
+            manifest = dataset / "meta/checksums.sha256"
+            manifest.write_text("legacy manifest is ignored\n", encoding="utf-8")
+            with mock.patch("hashlib.sha256", side_effect=AssertionError("unexpected hash")):
+                self.assertFalse(validate_dataset(dataset).errors)
+                manifest.unlink()
+                self.assertFalse(validate_dataset(dataset).errors)
 
     def test_abandoned_dataset_is_failed_and_has_validation_report(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

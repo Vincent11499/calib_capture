@@ -8,6 +8,7 @@
 - [项目 Agent 维护规范](../AGENTS.md)：后续 Agent 修改代码时必须遵守的硬件、ABI、数据与测试契约。工程只保留这一份顶层 Agent 文档。
 - [AXERA VIN/ABI 约束](./AXERA_IVPS.md)：VIN 获取、物理映射、完整帧释放和 SDK ABI。
 - [目录数据集格式](./DATASET_FORMAT.md)：文件、CSV、时间戳和 ROS1 bag 映射。
+- [板端验证记录](./BOARD_VALIDATION.md)：v1.5.1 默认 5 Hz、60 秒双目–IMU 实测结果与测试范围。
 
 板端部署目标为 `/workspace/minsky/Vincent/calib_capture`；对应宿主机目录是 `/workspace/test/Vincent/calib_capture`。SSH、SCP 和 Docker 进入步骤及授权边界见《使用操作说明》和顶层 `AGENTS.md`。
 
@@ -17,7 +18,7 @@
 - 标定（cali）默认映射为 `cam0=左目=VIN pipe 2/chn 0`、`cam1=右目=VIN pipe 0/chn 0`，接口为 `AX_VIN_GetYuvFrame`，源格式必须为 NV12。
 - 录制期间不要让其他消费者竞争读取相同的 VIN pipe/chn 输出队列。
 - 板端运行库默认为 `/soc/lib`；运行前设置 `BSP_MSP_DIR=/soc/lib` 和 `LD_LIBRARY_PATH=/soc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}`，脚本同时按依赖顺序加载现有 AX 库。随后调用 `AX_SYS_Init`、`AX_VIN_Init`，退出时反向释放当前 Python 消费者上下文。
-- 4K、mono8、双目 10 Hz、60 秒约产生 10 GB 图像。本工具不做容量或写速准入检查；写盘队列满时会成对丢弃左右图并写入质量报告。
+- 默认双目 5 Hz、60 秒，mono8 图像在 4K 下约 5 GB、1080p 下约 1.25 GB。本工具不做容量或写速准入检查；写盘队列满时会成对丢弃左右图并写入质量报告。
 
 ## 依赖与部署
 
@@ -88,18 +89,20 @@ python3 script/calibration_data.py stereo-triggered --output ./data
 ```bash
 python3 script/calibration_data.py stereo-continuous \
   --output ./data \
-  --duration-s 60 --frame-divisor 3
+  --duration-s 60 --save-rate-hz 5
 ```
 
-`--frame-divisor N` 按左右 `u64SeqNum` 源序号分频：第一对保存，之后当两侧源序号都至少前进 N 时再保存。源周期为 20 ms 且源帧可取得时，`3` 约为 60 ms/对（16.67 Hz），`5` 约为 100 ms/对（10 Hz）；若期间源帧已不可取得，实际间隔只会更长，并在元数据中记录序号缺口。它与按 PTS 控制目标频率的 `--save-rate-hz` 是两种互斥策略；两者都省略时默认保存 10 Hz。命令行显式策略会覆盖 YAML 中的另一策略，YAML 同一层不能同时设置正数 `frame_divisor` 和 `save_rate_hz`。
+默认 `--save-rate-hz 5` 按传感器 PTS 每约 200 ms 保存一对；该参数可省略。也可显式使用 `--frame-divisor N`，在左右源序号都至少前进 N 后保存一对。两种策略互斥，命令行策略覆盖 YAML；YAML 同一层不能同时设置正数 `frame_divisor` 和 `save_rate_hz`。
 
 双目–IMU采集：
 
 ```bash
 python3 script/calibration_data.py camera-imu \
   --output ./data \
-  --duration-s 60 --frame-divisor 5 --imu-topic /imu/data
+  --duration-s 60 --save-rate-hz 5 --imu-topic /imu/data
 ```
+
+图像默认保存 5 Hz，IMU 收到的消息全部保存，均使用原始传感器时间戳。
 
 `--output` 是会话根目录，默认就是 `./data`，因此可以省略。每次录制自动生成 `./data/YYYY-MM-DD_HH-MM-SS/`，不会直接把文件写到 `./data` 根目录。
 
@@ -107,14 +110,13 @@ python3 script/calibration_data.py camera-imu \
 
 ```bash
 python3 script/calibration_data.py validate ./data/2026-09-07_15-30-00
-python3 script/calibration_data.py validate ./data/2026-09-07_15-30-00 --verify-checksums
 python3 script/calibration_data.py export-ros1 \
   ./data/2026-09-07_15-30-00 \
   ./data/2026-09-07_15-30-00.bag
 ```
 
 可选 bag 压缩：`--compression lz4` 或 `--compression bz2`。默认不压缩。
-导出前固定执行完整 SHA-256 校验；导出后再打开 bag，逐话题核对消息类型、数量、首尾时间戳、单调性以及 Header stamp 与 bag record time 是否完全相同。实现基于 [rosbags 0.11 ROS1 Writer](https://ternaris.gitlab.io/rosbags/topics/rosbag1.html)。
+录制、结束收尾、校验与导出均不计算数据文件 SHA-256。导出前检查 BMP 格式/尺寸、CSV 配对与时间戳；导出后再打开 bag，逐话题核对消息类型、数量、首尾时间戳、单调性以及 Header stamp 与 bag record time 是否完全相同。实现基于 [rosbags 0.11 ROS1 Writer](https://ternaris.gitlab.io/rosbags/topics/rosbag1.html)。
 只有诊断损坏数据时才使用 `--force-dataset`；默认情况下任何硬校验错误都会阻止交付 bag。
 
 ## YAML 配置
@@ -134,6 +136,8 @@ python3 script/calibration_data.py --config script/default_config.yaml camera-im
 - 录制中的临时目录：时间戳目录使用 `.inprogress` 后缀。
 - `validation.json` 的 `status` 为 `pass`、`warning` 或 `fail`。队列丢帧、低实际频率及源序号缺口为警告；单侧缺失、时间倒退、同步超限、损坏 BMP、无 IMU 或时钟域不一致为失败。
 - 正常和失败数据集都会生成 `validation.json`；失败数据不会被静默删除。连续模式按源 PTS 统计真实取帧率和源序号缺口，保存降频造成的序号跳变不会误报为上游丢帧。
+- schema 2 使用 `data_integrity: structural`，不生成校验和清单；旧 schema 1 数据也可读取，旧清单会被忽略。等长度像素变化不再检测，截断文件、单侧缺失及错误尺寸仍会失败。
+- BMP 保留原 bottom-up 格式，改为大块写入。`meta/session.json` 的 `write_performance.mean_pair_ms`、`max_pair_ms` 记录每对真实写入耗时，不含取帧、队列等待或 `fsync`。
 - 板端找不到 SDK 头文件时仍会执行固定 ctypes ABI 检查并给出质量警告。要完成严格的哈希验收，请复制对应 SDK `include` 目录并传入 `--sdk-include-dir /path/to/include`。
 
 ## 无硬件自检
@@ -144,4 +148,4 @@ python3 calibration_data.py self-test
 python3 -m unittest discover -s tests -v
 ```
 
-自检覆盖 ctypes ABI、SDK 头文件哈希、BMP、颜色格式转换、PTS 限频、整对帧分频、目录数据集和校验和。安装 rosbags 后，测试还会生成并重新打开一份 ROS1 bag。
+自检覆盖 ctypes ABI、SDK 头文件哈希、BMP、大块写入、无数据哈希采集、颜色格式转换、PTS 限频、整对帧分频、目录结构和旧数据兼容性。安装 rosbags 后，测试还会生成并重新打开一份 ROS1 bag。

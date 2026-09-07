@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,19 +20,11 @@ from .axera import (
     GrayPair,
 )
 from .bmp import write_mono8_bmp
-from .config import APP_VERSION, CaptureConfig, SDK_HEADER_SHA256
+from .config import APP_VERSION, DATASET_SCHEMA_VERSION, CaptureConfig, SDK_HEADER_SHA256
 
 
 def utc_now_text() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while block := stream.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -90,7 +82,8 @@ def _yaml_scalar(value: Any) -> str:
 
 def write_dataset_yaml(path: Path, config: CaptureConfig, include_imu: bool) -> None:
     lines = [
-        "schema_version: 1",
+        f"schema_version: {DATASET_SCHEMA_VERSION}",
+        "data_integrity: structural",
         "dataset_type: calibration",
         "timestamp_unit: ns",
         f"mode: {_yaml_scalar(config.mode)}",
@@ -154,7 +147,8 @@ class DatasetWriter:
         self._last_left_timestamp = -1
         self._last_right_timestamp = -1
         self._last_imu_timestamp = -1
-        self._checksums: dict[str, str] = {}
+        self._pair_write_total_ns = 0
+        self._pair_write_max_ns = 0
         self._imu_lock = threading.Lock()
 
         self._cam0_stream = (self.staging_path / "cameras/cam0/timestamps.csv").open(
@@ -203,6 +197,7 @@ class DatasetWriter:
         return self._imu_count
 
     def write_pair(self, pair: GrayPair) -> None:
+        start_ns = time.perf_counter_ns()
         if self._closed:
             raise RuntimeError("dataset writer is closed")
         if pair.width != self.config.width or pair.height != self.config.height:
@@ -224,10 +219,10 @@ class DatasetWriter:
         left_temp = left_final.with_name("." + left_name + ".tmp")
         right_temp = right_final.with_name("." + right_name + ".tmp")
         try:
-            left_hash = write_mono8_bmp(
+            write_mono8_bmp(
                 left_temp, pair.width, pair.height, pair.left_pixels
             )
-            right_hash = write_mono8_bmp(
+            write_mono8_bmp(
                 right_temp, pair.width, pair.height, pair.right_pixels
             )
             os.replace(left_temp, left_final)
@@ -257,10 +252,11 @@ class DatasetWriter:
                 FORMAT_NAMES.get(pair.right_format, str(pair.right_format)),
             )
         )
-        self._checksums[f"cameras/cam0/{left_name}"] = left_hash
-        self._checksums[f"cameras/cam1/{right_name}"] = right_hash
         for stream in (self._cam0_stream, self._cam1_stream, self._pairs_stream):
             stream.flush()
+        elapsed_ns = time.perf_counter_ns() - start_ns
+        self._pair_write_total_ns += elapsed_ns
+        self._pair_write_max_ns = max(self._pair_write_max_ns, elapsed_ns)
 
     def write_imu(self, record: ImuRecord) -> None:
         if self._closed:
@@ -302,7 +298,8 @@ class DatasetWriter:
         self._close_streams()
         write_dataset_yaml(self.staging_path / "dataset.yaml", self.config, self.include_imu)
         session_data = {
-            "schema_version": 1,
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "data_integrity": "structural",
             "app_version": APP_VERSION,
             "created_utc": self.created_utc,
             "sealed_utc": utc_now_text(),
@@ -321,27 +318,17 @@ class DatasetWriter:
             },
             "pinned_sdk_header_sha256": SDK_HEADER_SHA256,
             **dict(session),
+            "write_performance": {
+                "pair_count": self._pair_count,
+                "mean_pair_ms": (
+                    self._pair_write_total_ns / self._pair_count / 1e6
+                    if self._pair_count else None
+                ),
+                "max_pair_ms": self._pair_write_max_ns / 1e6 if self._pair_count else None,
+                "total_pair_write_s": self._pair_write_total_ns / 1e9,
+            },
         }
         self.write_session(session_data)
-
-        payloads = [
-            Path("dataset.yaml"),
-            Path("cameras/cam0/timestamps.csv"),
-            Path("cameras/cam1/timestamps.csv"),
-            Path("meta/pairs.csv"),
-            Path("imu/imu0.csv"),
-            Path("meta/imu_full.jsonl"),
-        ]
-        for relative in payloads:
-            self._checksums[relative.as_posix()] = sha256_file(self.staging_path / relative)
-        manifest_path = self.staging_path / "meta/checksums.sha256"
-        _atomic_write_text(
-            manifest_path,
-            "".join(
-                f"{digest}  {relative}\n"
-                for relative, digest in sorted(self._checksums.items())
-            ),
-        )
         return session_data
 
     def write_session(self, session: Mapping[str, Any]) -> None:

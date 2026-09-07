@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
 
 
 BMP_FILE_HEADER = struct.Struct("<2sIHHI")
@@ -25,18 +23,13 @@ class BmpInfo:
     top_down: bool
 
 
-def _write_and_hash(stream: BinaryIO, digest: "hashlib._Hash", data: bytes | memoryview) -> None:
-    stream.write(data)
-    digest.update(data)
-
-
 def write_mono8_bmp(
     path: str | Path,
     width: int,
     height: int,
     pixels: bytes | bytearray | memoryview,
-) -> str:
-    """Write conventional bottom-up, uncompressed 8-bit grayscale BMP."""
+) -> None:
+    """Write a bottom-up mono8 BMP in large blocks, without payload hashing."""
 
     if width <= 0 or height <= 0:
         raise ValueError("BMP dimensions must be positive")
@@ -66,20 +59,24 @@ def write_mono8_bmp(
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256()
+    # Keep the existing byte layout, including row padding, while reducing
+    # thousands of per-row file writes to one header and one pixel-block write.
+    if padding:
+        payload = b"".join(
+            bytes(view[row * width : (row + 1) * width]) + padding
+            for row in range(height - 1, -1, -1)
+        )
+    else:
+        payload = b"".join(
+            view[row * width : (row + 1) * width]
+            for row in range(height - 1, -1, -1)
+        )
     with target.open("wb") as stream:
-        _write_and_hash(stream, digest, file_header)
-        _write_and_hash(stream, digest, info_header)
-        _write_and_hash(stream, digest, BMP_PALETTE)
-        for row in range(height - 1, -1, -1):
-            start = row * width
-            _write_and_hash(stream, digest, view[start : start + width])
-            if padding:
-                _write_and_hash(stream, digest, padding)
+        stream.write(file_header + info_header + BMP_PALETTE)
+        stream.write(payload)
         stream.flush()
     if target.stat().st_size != file_size:
         raise OSError(f"BMP size mismatch after write: {target}")
-    return digest.hexdigest()
 
 
 def inspect_mono8_bmp(path: str | Path) -> BmpInfo:

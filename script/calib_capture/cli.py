@@ -4,7 +4,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
 from .capture import (
     format_probe_result,
@@ -15,13 +14,14 @@ from .capture import (
 from .config import (
     APP_VERSION,
     DEFAULTS,
+    CaptureConfig,
     build_capture_config,
     detect_sdk_include_dir,
     session_output_path,
 )
 from .ros1_export import export_ros1_bag
 from .selftest import run_self_test
-from .validator import validate_dataset
+from .validator import ValidationReport, validate_dataset
 
 
 def _add_capture_options(
@@ -47,7 +47,15 @@ def _add_capture_options(
     parser.add_argument("--expected-source-rate-hz", type=float, default=None)
     if continuous:
         rate_control = parser.add_mutually_exclusive_group()
-        rate_control.add_argument("--save-rate-hz", type=float, default=None)
+        rate_control.add_argument(
+            "--save-rate-hz",
+            type=float,
+            default=None,
+            help=(
+                f"target stereo pair rate by PTS (default: {DEFAULTS['save_rate_hz']:g} Hz); "
+                "IMU messages are not rate-limited"
+            ),
+        )
         rate_control.add_argument(
             "--frame-divisor",
             type=int,
@@ -107,7 +115,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate = subparsers.add_parser("validate", help="validate a directory dataset")
     validate.add_argument("dataset")
-    validate.add_argument("--verify-checksums", action="store_true")
 
     export = subparsers.add_parser("export-ros1", help="export a dataset to ROS1 bag")
     export.add_argument("dataset")
@@ -123,13 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _capture_config(args: argparse.Namespace, mode: str) -> Any:
+def _capture_config(args: argparse.Namespace, mode: str) -> CaptureConfig:
     values = vars(args)
     overrides = {key: values.get(key) for key in DEFAULTS if values.get(key) is not None}
-    # Rate controls are one logical choice. An explicit CLI save rate must
-    # disable a frame divisor inherited from YAML so CLI > YAML remains true.
-    if values.get("save_rate_hz") is not None:
-        overrides["frame_divisor"] = 0
     output = ""
     if mode in {"stereo-triggered", "stereo-continuous", "camera-imu"}:
         output = session_output_path(str(values.get("output") or "./data"))
@@ -141,7 +144,7 @@ def _capture_config(args: argparse.Namespace, mode: str) -> Any:
     )
 
 
-def _print_capture_result(path: Path, report: Any) -> None:
+def _print_capture_result(path: Path, report: ValidationReport) -> None:
     print(
         json.dumps(
             {
@@ -183,7 +186,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "validate":
             report = validate_dataset(
                 args.dataset,
-                verify_checksums=args.verify_checksums,
                 write_report=True,
             )
             print(json.dumps(report.to_dict(), indent=2, sort_keys=True, ensure_ascii=False))

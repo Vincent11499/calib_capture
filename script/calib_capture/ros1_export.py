@@ -259,7 +259,7 @@ def export_ros1_bag(
         )
 
     dataset = Path(dataset_root).expanduser().resolve()
-    validation = validate_dataset(dataset, verify_checksums=True, write_report=True)
+    validation = validate_dataset(dataset, write_report=True)
     if validation.errors and not force_dataset:
         raise RuntimeError(
             "dataset validation failed; fix it or pass --force-dataset: "

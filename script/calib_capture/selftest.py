@@ -57,11 +57,10 @@ def run_self_test(sdk_include_dir: str = "") -> dict[str, Any]:
         temp = Path(raw_temp)
         pixels = bytes(range(15))
         bmp_path = temp / "small.bmp"
-        digest = write_mono8_bmp(bmp_path, 5, 3, pixels)
+        write_mono8_bmp(bmp_path, 5, 3, pixels)
         info, decoded = read_mono8_bmp(bmp_path)
         _check((info.width, info.height) == (5, 3), "BMP dimensions changed")
         _check(decoded == pixels, "BMP pixels did not round-trip")
-        _check(len(digest) == 64, "BMP SHA-256 length is invalid")
         tests.append("mono8_bmp_roundtrip")
 
         yuv = bytes((1, 2, 3, 9, 4, 5, 6, 9))
@@ -163,7 +162,7 @@ def run_self_test(sdk_include_dir: str = "") -> dict[str, Any]:
                 "sdk_header_contract": header_contract,
             }
         )
-        report = validate_dataset(dataset.staging_path, verify_checksums=True)
+        report = validate_dataset(dataset.staging_path)
         _check(not report.errors, "dataset validation failed: " + "; ".join(report.errors))
         session["validation_status"] = report.status
         dataset.write_session(session)

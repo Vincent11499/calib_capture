@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 import statistics
 import threading
 import time
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
 
 from .axera import (
     AX_FORMAT_YUV420_SEMIPLANAR,
-    AX_IMG_INFO_BASE_SIZE,
-    AX_VIDEO_FRAME_BASE_SIZE,
-    AxImgInfo,
     AxVinApi,
-    AxVideoFrame,
     GrayPair,
     StereoGrabber,
     assert_ctypes_abi,
@@ -49,20 +47,27 @@ def _estimated_stereo_gb(config: CaptureConfig, pair_count: float) -> float:
 
 
 class RateLimiter:
+    """Select the first pair at/after each sensor-time deadline, without bursts."""
+
     def __init__(self, rate_hz: float) -> None:
-        if rate_hz <= 0:
-            raise ValueError("rate_hz must be positive")
-        self.period_ns = round(NS_PER_SECOND / rate_hz)
-        self.next_timestamp_ns: int | None = None
+        if not math.isfinite(rate_hz) or rate_hz <= 0:
+            raise ValueError("rate_hz must be finite and positive")
+        # Keep the period as an integer ratio: rounding 1/6 second to whole
+        # nanoseconds would incorrectly move the 500 ms deadline past its frame.
+        rate = Fraction(str(rate_hz))
+        self._rate_numerator = rate.numerator
+        self._period_numerator_ns = NS_PER_SECOND * rate.denominator
+        self._origin_ns: int | None = None
+        self._next_slot = 1
 
     def accept(self, timestamp_ns: int) -> bool:
-        if self.next_timestamp_ns is None:
-            self.next_timestamp_ns = timestamp_ns + self.period_ns
+        if self._origin_ns is None:
+            self._origin_ns = timestamp_ns
             return True
-        if timestamp_ns < self.next_timestamp_ns:
+        elapsed_scaled = (timestamp_ns - self._origin_ns) * self._rate_numerator
+        if elapsed_scaled < self._next_slot * self._period_numerator_ns:
             return False
-        periods = (timestamp_ns - self.next_timestamp_ns) // self.period_ns + 1
-        self.next_timestamp_ns += periods * self.period_ns
+        self._next_slot = elapsed_scaled // self._period_numerator_ns + 1
         return True
 
 
@@ -310,6 +315,8 @@ class ImuSubscriber:
             self._node = None
         if self._rclpy is not None and self._rclpy.ok():
             self._rclpy.shutdown()
+        # A callback may fail after the capture loop's last error check.
+        self.raise_if_failed()
 
 
 def _make_grabber(api: AxVinApi, config: CaptureConfig) -> StereoGrabber:
@@ -362,75 +369,30 @@ def _finish_dataset(
     return dataset.commit(success), report
 
 
-def _base_session(
-    config: CaptureConfig,
-    api: AxVinApi,
-    grabber: StereoGrabber,
-    warmup: dict[str, Any],
-    stats: dict[str, Any],
-    deinit_result: int,
-) -> dict[str, Any]:
-    return {
-        "mode": config.mode,
-        "capture_status": stats.get("capture_status", "completed"),
-        "finished_utc": utc_now_text(),
-        "ax_library_dir": api.library_dir,
-        "sdk_header_contract": api.header_contract,
-        "ax_video_frame_abi": {
-            "base_size": AX_VIDEO_FRAME_BASE_SIZE,
-            "pts_offset": AxVideoFrame.u64PTS.offset,
-            "sequence_offset": AxVideoFrame.u64SeqNum.offset,
-        },
-        "ax_img_info_abi": {
-            "base_size": AX_IMG_INFO_BASE_SIZE,
-            "frame_info_offset": AxImgInfo.tFrameInfo.offset,
-            "isp_info_offset": AxImgInfo.tIspInfo.offset,
-        },
-        "ax_deinit_result": deinit_result,
-        "ax_return_errors": list(api.ax_errors),
-        "imu_qos": {
-            "reliability": "best_effort",
-            "durability": "volatile",
-            "history": "keep_last",
-            "depth": config.imu_qos_depth,
-        },
-        "warmup_frame": warmup,
-        "grabber_stats": grabber.stats,
-        "capture_stats": stats,
-        "imu_qos": {
-            "reliability": "best_effort",
-            "durability": "volatile",
-            "history": "keep_last",
-            "depth": config.imu_qos_depth,
-        },
-    }
-
-
-def _failure_session(
+def _capture_session(
     config: CaptureConfig,
     api: AxVinApi | None,
     grabber: StereoGrabber | None,
     warmup: dict[str, Any],
     stats: dict[str, Any],
     deinit_result: int | None,
+    *,
+    failed: bool = False,
 ) -> dict[str, Any]:
+    # DatasetWriter adds configuration and ABI metadata for every outcome.
     session: dict[str, Any] = {
         "mode": config.mode,
-        "capture_status": "failed",
+        "capture_status": "failed" if failed else stats.get("capture_status", "completed"),
         "finished_utc": utc_now_text(),
-        "ax_video_frame_abi": {
-            "base_size": AX_VIDEO_FRAME_BASE_SIZE,
-            "pts_offset": AxVideoFrame.u64PTS.offset,
-            "sequence_offset": AxVideoFrame.u64SeqNum.offset,
-        },
-        "ax_img_info_abi": {
-            "base_size": AX_IMG_INFO_BASE_SIZE,
-            "frame_info_offset": AxImgInfo.tFrameInfo.offset,
-            "isp_info_offset": AxImgInfo.tIspInfo.offset,
-        },
         "ax_deinit_result": deinit_result,
         "warmup_frame": warmup,
         "capture_stats": stats,
+        "imu_qos": {
+            "reliability": "best_effort",
+            "durability": "volatile",
+            "history": "keep_last",
+            "depth": config.imu_qos_depth,
+        },
     }
     if api is not None:
         session["ax_library_dir"] = api.library_dir
@@ -578,7 +540,7 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
                     (int(stats["source_pairs"]) - 1) * NS_PER_SECOND / source_span_ns
                 )
         deinit_result = api.close()
-        session = _base_session(config, api, grabber, warmup, stats, deinit_result)
+        session = _capture_session(config, api, grabber, warmup, stats, deinit_result)
         return _finish_dataset(dataset, session, requested_success=True)
     except BaseException as exc:
         cleanup_errors: list[str] = []
@@ -603,7 +565,7 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
             stats["cleanup_errors"] = cleanup_errors
         failed_path = dataset.abandon(
             exc,
-            _failure_session(config, api, grabber, warmup, stats, deinit_result),
+            _capture_session(config, api, grabber, warmup, stats, deinit_result, failed=True),
         )
         raise CaptureFailed(
             f"capture failed; recoverable data kept at {failed_path}: {exc}"
@@ -663,7 +625,7 @@ def record_triggered(
             )
         deinit_result = api.close()
         stats["writer_saved_pairs"] = dataset.pair_count
-        session = _base_session(config, api, grabber, warmup, stats, deinit_result)
+        session = _capture_session(config, api, grabber, warmup, stats, deinit_result)
         return _finish_dataset(dataset, session, requested_success=True)
     except (KeyboardInterrupt, UserAbort) as exc:
         stats["capture_status"] = "failed"
@@ -675,7 +637,7 @@ def record_triggered(
                 pass
         failed_path = dataset.abandon(
             exc,
-            _failure_session(config, api, grabber, warmup, stats, deinit_result),
+            _capture_session(config, api, grabber, warmup, stats, deinit_result, failed=True),
         )
         raise CaptureFailed(
             f"triggered capture incomplete; data kept at {failed_path}: {exc}"
@@ -689,7 +651,7 @@ def record_triggered(
                 pass
         failed_path = dataset.abandon(
             exc,
-            _failure_session(config, api, grabber, warmup, stats, deinit_result),
+            _capture_session(config, api, grabber, warmup, stats, deinit_result, failed=True),
         )
         raise CaptureFailed(f"capture failed; data kept at {failed_path}: {exc}") from exc
 
@@ -740,7 +702,7 @@ def probe_hardware(
                     grabber.release_frames(frames)
         if imu is not None:
             time.sleep(0.2)
-            imu.raise_if_failed()
+            imu.stop()
             imu_summary = {
                 "topic": config.imu_topic,
                 "received_samples": imu.count,
@@ -754,7 +716,6 @@ def probe_hardware(
                 },
             }
             imu_timestamps = [record.timestamp_ns for record in imu.records]
-            imu.stop()
             imu = None
         deinit_result = api.close()
     finally:

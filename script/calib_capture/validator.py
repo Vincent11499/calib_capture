@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass, field
@@ -9,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .bmp import inspect_mono8_bmp
-from .config import SDK_HEADER_SHA256
+from .config import DATASET_SCHEMA_VERSION, SDK_HEADER_SHA256
 
 
 @dataclass
@@ -66,47 +65,9 @@ def _effective_rate(values: list[int]) -> float | None:
     return (len(values) - 1) * 1_000_000_000.0 / (values[-1] - values[0])
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while block := stream.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _load_manifest(path: Path, report: ValidationReport) -> dict[str, str]:
-    entries: dict[str, str] = {}
-    if not path.is_file():
-        report.error("missing meta/checksums.sha256")
-        return entries
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
-        report.error(f"cannot read checksum manifest: {exc}")
-        return entries
-    for line_number, raw in enumerate(lines, 1):
-        if not raw.strip():
-            continue
-        try:
-            digest, relative = raw.split("  ", 1)
-        except ValueError:
-            report.error(f"invalid checksum line {line_number}")
-            continue
-        if (
-            len(digest) != 64
-            or any(character not in "0123456789abcdefABCDEF" for character in digest)
-            or relative in entries
-        ):
-            report.error(f"invalid or duplicate checksum entry: {relative}")
-            continue
-        entries[relative] = digest.lower()
-    return entries
-
-
 def validate_dataset(
     root: str | Path,
     *,
-    verify_checksums: bool = False,
     write_report: bool = True,
 ) -> ValidationReport:
     dataset = Path(root).expanduser().resolve()
@@ -119,7 +80,6 @@ def validate_dataset(
         "meta/pairs.csv",
         "meta/imu_full.jsonl",
         "meta/session.json",
-        "meta/checksums.sha256",
     ]
     for relative in required:
         if not (dataset / relative).is_file():
@@ -137,6 +97,11 @@ def validate_dataset(
     if not isinstance(session, dict):
         report.error("meta/session.json root is not an object")
         session = {}
+    schema_version = session.get("schema_version")
+    if schema_version not in (1, DATASET_SCHEMA_VERSION):
+        report.error(f"unsupported dataset schema_version: {schema_version!r}")
+    if schema_version == DATASET_SCHEMA_VERSION and session.get("data_integrity") != "structural":
+        report.error("session data_integrity must be structural")
     config = session.get("config", {})
     if not isinstance(config, dict):
         report.error("meta/session.json config is not an object")
@@ -212,7 +177,7 @@ def validate_dataset(
     try:
         dataset_yaml = (dataset / "dataset.yaml").read_text(encoding="utf-8")
         required_yaml_lines = (
-            "schema_version: 1",
+            f"schema_version: {schema_version}",
             "timestamp_unit: ns",
             "capture_api: AX_VIN_GetYuvFrame",
             "source_pixel_format: NV12",
@@ -225,6 +190,8 @@ def validate_dataset(
         for required_line in required_yaml_lines:
             if required_line not in dataset_yaml:
                 report.error(f"dataset.yaml is missing contract entry: {required_line.strip()}")
+        if schema_version == DATASET_SCHEMA_VERSION and "data_integrity: structural" not in dataset_yaml:
+            report.error("dataset.yaml is missing data_integrity: structural")
         resolution_line = f"    resolution: [{expected_width}, {expected_height}]"
         if expected_width and expected_height and dataset_yaml.count(resolution_line) != 2:
             report.error("dataset.yaml camera resolutions disagree with session metadata")
@@ -509,50 +476,6 @@ def validate_dataset(
     except (TypeError, ValueError):
         report.error("invalid pair_count or imu_count in session metadata")
 
-    manifest = _load_manifest(dataset / "meta/checksums.sha256", report)
-    referenced_payloads = {
-        f"cameras/cam0/{row.get('filename', '')}" for row in cam0_rows
-    } | {
-        f"cameras/cam1/{row.get('filename', '')}" for row in cam1_rows
-    }
-    referenced_payloads.update(
-        {
-            "dataset.yaml",
-            "cameras/cam0/timestamps.csv",
-            "cameras/cam1/timestamps.csv",
-            "meta/pairs.csv",
-            "imu/imu0.csv",
-            "meta/imu_full.jsonl",
-        }
-    )
-    for relative in referenced_payloads:
-        if relative not in manifest:
-            report.error(f"payload missing from checksum manifest: {relative}")
-    unexpected_manifest_entries = sorted(set(manifest) - referenced_payloads)
-    if unexpected_manifest_entries:
-        report.error(
-            "checksum manifest has unreferenced entries: "
-            + ", ".join(unexpected_manifest_entries[:5])
-        )
-    for relative, expected_hash in manifest.items():
-        path = dataset / Path(relative)
-        try:
-            resolved = path.resolve()
-            resolved.relative_to(dataset)
-        except (OSError, ValueError):
-            report.error(f"unsafe checksum path: {relative}")
-            continue
-        if not path.is_file():
-            report.error(f"checksum target is missing: {relative}")
-        elif verify_checksums:
-            try:
-                actual_hash = _sha256(path)
-            except OSError as exc:
-                report.error(f"cannot hash {relative}: {exc}")
-            else:
-                if actual_hash != expected_hash:
-                    report.error(f"checksum mismatch: {relative}")
-
     camera_rate0 = _effective_rate(cam0_ts)
     camera_rate1 = _effective_rate(cam1_ts)
     imu_rate = _effective_rate(imu_ts)
@@ -669,8 +592,8 @@ def validate_dataset(
         "imu_long_gap_count": imu_long_gap_count,
         "camera_imu_first_offset_ns": camera_imu_first_offset_ns,
         "camera_imu_common_window_ns": camera_imu_common_window_ns,
-        "checksum_entries": len(manifest),
-        "checksums_verified": verify_checksums,
+        "data_integrity": "structural",
+        "checksums_verified": False,
     }
     if write_report:
         _write_validation_report(dataset, report)
