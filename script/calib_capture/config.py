@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-APP_VERSION = "1.6.0"
-DATASET_SCHEMA_VERSION = 2
+APP_VERSION = "1.8.0"
+DATASET_SCHEMA_VERSION = 3
 NS_PER_SECOND = 1_000_000_000
 SESSION_DIRECTORY_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
@@ -38,6 +38,9 @@ DEFAULTS: dict[str, Any] = {
     "right_pipe": 0,
     "right_chn": 0,
     "resolution": "3840x2160",
+    "image_format": "bmp",
+    "jpeg_quality": 95,
+    "image_workers": 2,
     "expected_source_rate_hz": 50.0,
     "save_rate_hz": 5.0,
     "frame_divisor": 0,
@@ -157,6 +160,9 @@ class CaptureConfig:
     right_chn: int
     width: int
     height: int
+    image_format: str
+    jpeg_quality: int
+    image_workers: int
     expected_source_rate_hz: float
     save_rate_hz: float
     frame_divisor: int
@@ -230,6 +236,15 @@ def build_capture_config(
     values.update(override_values)
 
     width, height = parse_resolution(str(values.pop("resolution")))
+    values["image_format"] = str(values["image_format"]).lower()
+    if values["image_format"] not in {"bmp", "jpeg"}:
+        raise ValueError("image_format must be bmp or jpeg")
+    values["jpeg_quality"] = int(values["jpeg_quality"])
+    if not 1 <= values["jpeg_quality"] <= 100:
+        raise ValueError("jpeg_quality must be between 1 and 100")
+    values["image_workers"] = int(values["image_workers"])
+    if not 1 <= values["image_workers"] <= 8:
+        raise ValueError("image_workers must be between 1 and 8")
     values["sdk_include_dir"] = detect_sdk_include_dir(str(values["sdk_include_dir"]))
 
     integer_nonnegative = ("left_pipe", "left_chn", "right_pipe", "right_chn")

@@ -6,9 +6,13 @@
 
 连续采集默认保存双目 5 Hz（约 200 ms 一对），IMU 收到的消息全部保存。默认持续 60 秒，4K 双目图像约 5 GB。
 
+`image_workers`／`--image-workers` 默认 2（1–8），BMP/JPEG 共用有界图像线程池，按双目对顺序提交。Y 平面直接复制到复用缓冲；CSV/IMU JSONL 每 0.5 秒批量刷新，正常退出最终刷新。默认 5 Hz 不变，20 Hz 仅作为显式性能探索目标。
+
 配置可通过 `--config script/default_config.ini` 指定，使用 Python 标准库 `configparser`，无需 PyYAML；不指定时使用内置默认值和命令行参数，不自动读取模板。`--config` 须放在子命令前。
 
 图像按大块写入，不计算数据文件 SHA-256。校验保留 BMP 格式/大小、配对、CSV 与时间戳一致性检查；不能检测文件长度未变的像素位错误。
+
+需要减小体积时，在 INI `[capture]` 中设置 `image_format = jpeg`、`jpeg_quality = 95`，或传 `--image-format jpeg --jpeg-quality 95`。JPEG 直接使用现有 OpenCV/NumPy 编解码，不使用 Pillow；保存有损灰度 JPG，不缩放，质量范围 1–100。旧 BMP 数据仍可读取，bag 导出使用解码后的 mono8。
 
 ## 文档
 

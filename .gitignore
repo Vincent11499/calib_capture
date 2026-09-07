@@ -13,6 +13,8 @@ output/
 *.db3-wal
 *.mcap
 *.bmp
+*.jpg
+*.jpeg
 
 # Python environments, caches and build products.
 __pycache__/

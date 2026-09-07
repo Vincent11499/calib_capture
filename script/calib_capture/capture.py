@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import queue
 import statistics
 import threading
 import time
@@ -13,7 +12,6 @@ from typing import Any, Callable
 from .axera import (
     AX_FORMAT_YUV420_SEMIPLANAR,
     AxVinApi,
-    GrayPair,
     StereoGrabber,
     assert_ctypes_abi,
 )
@@ -21,6 +19,8 @@ from .bmp import BMP_PIXEL_OFFSET
 from .config import CaptureConfig, NS_PER_SECOND
 from .dataset import DatasetWriter, ImuRecord, utc_now_text
 from .validator import ValidationReport, validate_dataset
+from .pipeline import PairDiskWriter
+from .performance import peak_rss_bytes
 
 
 def monotonic_raw_ns() -> int:
@@ -105,67 +105,6 @@ class FrameDivider:
         self.last_left_sequence = left_sequence
         self.last_right_sequence = right_sequence
         return True
-
-
-class PairDiskWriter:
-    def __init__(self, dataset: DatasetWriter, capacity: int) -> None:
-        self.dataset = dataset
-        self.queue: queue.Queue[GrayPair | None] = queue.Queue(maxsize=capacity)
-        self.error: BaseException | None = None
-        self.written = 0
-        self._finish_started = False
-        self._thread = threading.Thread(
-            target=self._run,
-            name="calibration-bmp-writer",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def _run(self) -> None:
-        while True:
-            item = self.queue.get()
-            try:
-                if item is None:
-                    return
-                if self.error is None:
-                    try:
-                        self.dataset.write_pair(item)
-                        self.written += 1
-                    except BaseException as exc:
-                        self.error = exc
-            finally:
-                self.queue.task_done()
-
-    def full(self) -> bool:
-        return self.queue.full()
-
-    def submit(self, pair: GrayPair) -> bool:
-        self.raise_if_failed()
-        try:
-            self.queue.put_nowait(pair)
-            return True
-        except queue.Full:
-            return False
-
-    def raise_if_failed(self) -> None:
-        if self.error is not None:
-            raise RuntimeError(f"BMP writer failed: {self.error}") from self.error
-
-    def finish(self) -> None:
-        if self._finish_started:
-            if self._thread.is_alive():
-                self._thread.join(timeout=5.0)
-            if self._thread.is_alive():
-                raise RuntimeError("BMP writer thread did not stop")
-            self.raise_if_failed()
-            return
-        self._finish_started = True
-        self.queue.put(None)
-        self.queue.join()
-        self._thread.join(timeout=5.0)
-        if self._thread.is_alive():
-            raise RuntimeError("BMP writer thread did not stop")
-        self.raise_if_failed()
 
 
 class ImuSubscriber:
@@ -334,11 +273,11 @@ def _make_grabber(api: AxVinApi, config: CaptureConfig) -> StereoGrabber:
     )
 
 
-def _warmup_pair(grabber: StereoGrabber) -> tuple[dict[str, Any], int]:
+def _warmup_pair(grabber: StereoGrabber, *, bottom_up: bool = False) -> tuple[dict[str, Any], int]:
     frames = grabber.grab_frames()
     try:
         description = grabber.describe_frames(frames)
-        pair = grabber.copy_gray_pair(frames, release_after_copy=True)
+        pair = grabber.copy_gray_pair(frames, release_after_copy=True, bottom_up=bottom_up)
         if len(pair.left_pixels) != pair.width * pair.height:
             raise RuntimeError("left grayscale conversion returned the wrong size")
         if len(pair.right_pixels) != pair.width * pair.height:
@@ -356,7 +295,10 @@ def _finish_dataset(
     requested_success: bool,
 ) -> tuple[Path, ValidationReport]:
     session_data = dataset.seal_payload(session)
+    validation_start = time.perf_counter()
     report = validate_dataset(dataset.staging_path, write_report=True)
+    session_data["validation_duration_s"] = time.perf_counter() - validation_start
+    session_data["peak_rss_bytes"] = peak_rss_bytes()
     session_data["capture_status"] = (
         session.get("capture_status", "completed") if requested_success else "failed"
     )
@@ -400,6 +342,7 @@ def _capture_session(
         session["ax_return_errors"] = list(api.ax_errors)
     if grabber is not None:
         session["grabber_stats"] = grabber.stats
+        session["capture_stages"] = grabber.timings.summary()
     return session
 
 
@@ -414,10 +357,12 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
         else f"PTS rate limit {config.save_rate_hz:g} Hz"
     )
     print(
-        f"Estimated stereo BMP payload using {rate_description}: "
+        f"Uncompressed stereo BMP equivalent using {rate_description}: "
         f"{_estimated_stereo_gb(config, estimated_pairs):.2f} GB. "
         "No free-space or write-speed preflight is performed."
     )
+    if config.image_format == "jpeg":
+        print(f"Saving grayscale JPEG quality={config.jpeg_quality} (lossy); actual size depends on image content.")
     dataset = DatasetWriter(config.output, config, include_imu)
     api: AxVinApi | None = None
     grabber: StereoGrabber | None = None
@@ -447,7 +392,7 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
         else:
             first_imu_timestamp = None
 
-        warmup, warmup_timestamp = _warmup_pair(grabber)
+        warmup, warmup_timestamp = _warmup_pair(grabber, bottom_up=config.image_format == "bmp")
         if first_imu_timestamp is not None:
             offset_ns = abs(warmup_timestamp - first_imu_timestamp)
             stats["startup_camera_imu_offset_ns"] = offset_ns
@@ -459,7 +404,9 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
         pair_writer = PairDiskWriter(dataset, config.writer_queue_pairs)
         divider = FrameDivider(config.frame_divisor) if config.frame_divisor > 0 else None
         limiter = None if divider is not None else RateLimiter(config.save_rate_hz)
-        deadline = time.monotonic() + config.duration_s
+        capture_started = time.monotonic()
+        capture_cpu_started = time.process_time()
+        deadline = capture_started + config.duration_s
         previous_left_ns = int(warmup["left"]["timestamp_us"]) * 1000
         previous_right_ns = int(warmup["right"]["timestamp_us"]) * 1000
         # The warmup performs one full-resolution gray copy. Do not count the
@@ -508,14 +455,21 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
                     if limiter is not None and not limiter.accept(pair_timestamp_ns):
                         stats["rate_limiter_skipped_pairs"] += 1
                         continue
-                    if pair_writer.full():
+                    slot = pair_writer.reserve()
+                    if slot is None:
                         stats["writer_queue_drop_pairs"] += 1
                         continue
-                    gray_pair = grabber.copy_gray_pair(
-                        frames, release_after_copy=True
-                    )
-                    if not pair_writer.submit(gray_pair):
-                        stats["writer_queue_drop_pairs"] += 1
+                    try:
+                        gray_pair = grabber.copy_gray_pair(
+                            frames, release_after_copy=True, buffers=slot,
+                            bottom_up=config.image_format == "bmp")
+                        if pair_writer.submit(gray_pair, slot):
+                            slot = None  # Ownership transferred to the writer.
+                        else:
+                            stats["writer_queue_drop_pairs"] += 1
+                    finally:
+                        if slot is not None:
+                            pair_writer.pool.release(slot)
                 finally:
                     if not frames.released:
                         grabber.release_frames(frames)
@@ -526,7 +480,12 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
         if imu is not None:
             imu.stop()
             imu = None
+        stats["capture_wall_s"] = time.monotonic() - capture_started
         pair_writer.finish()
+        stats["capture_and_drain_cpu_s"] = time.process_time() - capture_cpu_started
+        stats["capture_and_drain_wall_s"] = time.monotonic() - capture_started
+        stats["pipeline"] = pair_writer.summary()
+        stats["capture_peak_rss_bytes"] = peak_rss_bytes()
         pair_writer = None
         stats["writer_saved_pairs"] = dataset.pair_count
         stats["imu_saved_samples"] = dataset.imu_count
@@ -554,6 +513,7 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
                 pair_writer.finish()
             except BaseException as cleanup_error:
                 cleanup_errors.append(f"pair writer stop: {cleanup_error}")
+            stats["pipeline"] = pair_writer.summary()
         stats["writer_saved_pairs"] = dataset.pair_count
         stats["imu_saved_samples"] = dataset.imu_count
         if api is not None and deinit_result is None:
@@ -580,7 +540,7 @@ def record_triggered(
     if not config.output:
         raise ValueError("--output is required")
     print(
-        f"Estimated stereo BMP payload for {config.poses} poses: "
+        f"Uncompressed stereo BMP equivalent for {config.poses} poses: "
         f"{_estimated_stereo_gb(config, config.poses):.2f} GB. "
         "No free-space or write-speed preflight is performed."
     )
@@ -597,12 +557,15 @@ def record_triggered(
     try:
         api = AxVinApi(config.ax_lib_dir, config.sdk_include_dir)
         grabber = _make_grabber(api, config)
-        warmup, _ = _warmup_pair(grabber)
+        warmup, _ = _warmup_pair(grabber, bottom_up=config.image_format == "bmp")
+        storage = (f"JPEG quality={config.jpeg_quality} (lossy)"
+                   if config.image_format == "jpeg" else "mono8 BMP")
         print(
-            f"Ready: {config.width}x{config.height} mono8 BMP, "
+            f"Ready: {config.width}x{config.height} {storage}, "
             f"VIN left pipe {config.left_pipe}/chn {config.left_chn}, "
             f"right pipe {config.right_pipe}/chn {config.right_chn}."
         )
+        buffers = (bytearray(config.width * config.height), bytearray(config.width * config.height))
         for pose_index in range(1, config.poses + 1):
             command = input_function(
                 f"[{pose_index}/{config.poses}] Place target, press Enter to save (q abort): "
@@ -614,7 +577,8 @@ def record_triggered(
             frames = grabber.grab_frames()
             try:
                 stats["source_pairs"] += 1
-                pair = grabber.copy_gray_pair(frames, release_after_copy=True)
+                pair = grabber.copy_gray_pair(frames, release_after_copy=True,
+                                              buffers=buffers, bottom_up=config.image_format == "bmp")
             finally:
                 if not frames.released:
                     grabber.release_frames(frames)

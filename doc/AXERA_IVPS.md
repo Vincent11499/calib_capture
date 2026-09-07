@@ -45,10 +45,10 @@ vis 模式另有两套已确认输出：VIN 仍为左 pipe 2、右 pipe 0、chn 
 2. 若 PTS 差超过 2000 µs，释放较早帧并重新获取，最多 10 次。
 3. 校验分辨率、stride、压缩模式和像素格式。
 4. 通过 `AX_SYS_MmapCache` 获取虚拟地址，并调用 `AX_SYS_MinvalidateCache`。
-5. 将有效行数据复制到 Python 自有 `bytes`。
+5. 将有效 Y 行直接复制到可复用的 Python 自有 `bytearray`；BMP 同时形成 bottom-up 行序，JPEG 保持 top-down，不再保留中间 raw/gray 两份整图。无 NumPy 时保留逐行拷贝回退路径。
 6. 对脚本创建的映射立即调用 `AX_SYS_Munmap`。
 7. 左右帧分别以获取时的完整 `AX_IMG_INFO_T`，按原 pipe/chn 调用一次 `AX_VIN_ReleaseYuvFrame`。
-8. 在不再持有 SDK 映射或帧的情况下提取/转换灰度并写 BMP。
+8. 在不再持有 SDK 映射或帧的情况下，由图像工作线程写 BMP 或编码 JPEG；全部相关任务结束后才能复用缓冲。
 
 任何中途异常也执行相同的释放规则。
 

@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +20,9 @@ from .axera import (
     AxVideoFrame,
     GrayPair,
 )
-from .bmp import write_mono8_bmp
+from .image_io import ensure_image_support, image_suffix, write_mono8_image
 from .config import APP_VERSION, DATASET_SCHEMA_VERSION, CaptureConfig, SDK_HEADER_SHA256
+from .performance import Timings, peak_rss_bytes
 
 
 def utc_now_text() -> str:
@@ -89,6 +91,9 @@ def write_dataset_yaml(path: Path, config: CaptureConfig, include_imu: bool) -> 
         f"mode: {_yaml_scalar(config.mode)}",
         "capture_api: AX_VIN_GetYuvFrame",
         "source_pixel_format: NV12",
+        f"image_format: {config.image_format}",
+        f"jpeg_quality: {config.jpeg_quality}",
+        f"lossy: {_yaml_scalar(config.image_format == 'jpeg')}",
         "cameras:",
         "  cam0:",
         "    side: left",
@@ -116,10 +121,23 @@ def write_dataset_yaml(path: Path, config: CaptureConfig, include_imu: bool) -> 
     _atomic_write_text(path, "\n".join(lines) + "\n")
 
 
+@dataclass
+class PendingPair:
+    pair: GrayPair
+    temporary: tuple[Path, Path]
+    final: tuple[Path, Path]
+    futures: list[Future]
+    started_ns: int
+
+    def done(self) -> bool:
+        return all(future.done() for future in self.futures)
+
+
 class DatasetWriter:
     """Owns one recoverable directory-dataset staging area."""
 
     def __init__(self, output: str | Path, config: CaptureConfig, include_imu: bool) -> None:
+        ensure_image_support(config.image_format)
         final_path = Path(output).expanduser().resolve()
         if final_path.name.endswith((".inprogress", ".failed")):
             raise ValueError("output must be the desired final dataset directory")
@@ -147,9 +165,17 @@ class DatasetWriter:
         self._last_left_timestamp = -1
         self._last_right_timestamp = -1
         self._last_imu_timestamp = -1
+        self._last_submitted_left = -1
+        self._last_submitted_right = -1
         self._pair_write_total_ns = 0
         self._pair_write_max_ns = 0
         self._imu_lock = threading.Lock()
+        self._camera_lock = threading.Lock()
+        self.timings = Timings()
+        self._flush_stop = threading.Event()
+        self._flush_error: BaseException | None = None
+        self._camera_dirty = False
+        self._imu_dirty = False
 
         self._cam0_stream = (self.staging_path / "cameras/cam0/timestamps.csv").open(
             "w", encoding="utf-8", newline=""
@@ -187,6 +213,11 @@ class DatasetWriter:
         self._imu_writer.writerow(
             ("timestamp_ns", "gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z")
         )
+        self._image_executor = ThreadPoolExecutor(
+            max_workers=config.image_workers, thread_name_prefix="image")
+        self._flush_thread = threading.Thread(target=self._flush_loop,
+                                               name="metadata-flush", daemon=True)
+        self._flush_thread.start()
 
     @property
     def pair_count(self) -> int:
@@ -197,7 +228,13 @@ class DatasetWriter:
         return self._imu_count
 
     def write_pair(self, pair: GrayPair) -> None:
+        """Synchronous convenience path for triggered capture and offline tests."""
+        self.finish_pair(self.start_pair(pair))
+
+    def start_pair(self, pair: GrayPair) -> PendingPair:
+        """Schedule only image tasks; the coordinator owns ordering and commits."""
         start_ns = time.perf_counter_ns()
+        self.raise_if_failed()
         if self._closed:
             raise RuntimeError("dataset writer is closed")
         if pair.width != self.config.width or pair.height != self.config.height:
@@ -207,34 +244,67 @@ class DatasetWriter:
             or pair.right_format != AX_FORMAT_YUV420_SEMIPLANAR
         ):
             raise ValueError("calibration dataset source frames must both be NV12")
-        if pair.left_timestamp_ns <= self._last_left_timestamp:
+        if pair.left_timestamp_ns <= self._last_submitted_left:
             raise ValueError("left camera timestamp is not strictly increasing")
-        if pair.right_timestamp_ns <= self._last_right_timestamp:
+        if pair.right_timestamp_ns <= self._last_submitted_right:
             raise ValueError("right camera timestamp is not strictly increasing")
 
-        left_name = f"{pair.left_timestamp_ns}.bmp"
-        right_name = f"{pair.right_timestamp_ns}.bmp"
+        suffix = image_suffix(self.config.image_format)
+        left_name = f"{pair.left_timestamp_ns}{suffix}"
+        right_name = f"{pair.right_timestamp_ns}{suffix}"
         left_final = self.staging_path / "cameras/cam0" / left_name
         right_final = self.staging_path / "cameras/cam1" / right_name
         left_temp = left_final.with_name("." + left_name + ".tmp")
         right_temp = right_final.with_name("." + right_name + ".tmp")
+        futures: list[Future] = []
+        pending = PendingPair(pair, (left_temp, right_temp), (left_final, right_final),
+                              futures, start_ns)
         try:
-            write_mono8_bmp(
-                left_temp, pair.width, pair.height, pair.left_pixels
-            )
-            write_mono8_bmp(
-                right_temp, pair.width, pair.height, pair.right_pixels
-            )
-            os.replace(left_temp, left_final)
-            os.replace(right_temp, right_final)
+            jobs = ((left_temp, pair.left_pixels), (right_temp, pair.right_pixels))
+            for path, pixels in jobs:
+                futures.append(self._image_executor.submit(
+                    write_mono8_image, path, pair.width, pair.height, pixels,
+                    self.config.image_format, self.config.jpeg_quality, pair.bottom_up))
         except BaseException:
-            for temporary in (left_temp, right_temp):
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            self.cancel_pair(pending)
             raise
+        self._last_submitted_left = pair.left_timestamp_ns
+        self._last_submitted_right = pair.right_timestamp_ns
+        return pending
 
+    def cancel_pair(self, pending: PendingPair) -> None:
+        # Workers may still be writing. Never remove files or recycle their
+        # source buffers before every successfully submitted task has exited.
+        wait(pending.futures)
+        for path in pending.temporary:
+            path.unlink(missing_ok=True)
+
+    def finish_pair(self, pending: PendingPair) -> None:
+        wait(pending.futures)
+        try:
+            self.raise_if_failed()
+            for future in pending.futures:
+                for stage, elapsed in (future.result() or {}).items():
+                    self.timings.add(stage, elapsed)
+            start = time.perf_counter_ns()
+            with self._camera_lock:
+                self._commit_pair(pending)
+            self.timings.add("pair_commit", time.perf_counter_ns() - start)
+        except BaseException:
+            self.cancel_pair(pending)
+            raise
+        elapsed_ns = time.perf_counter_ns() - pending.started_ns
+        self._pair_write_total_ns += elapsed_ns
+        self._pair_write_max_ns = max(self._pair_write_max_ns, elapsed_ns)
+
+    def _commit_pair(self, pending: PendingPair) -> None:
+        pair = pending.pair
+        if (pair.left_timestamp_ns <= self._last_left_timestamp or
+                pair.right_timestamp_ns <= self._last_right_timestamp):
+            raise ValueError("pair commit timestamps are not strictly increasing")
+        for temporary, final in zip(pending.temporary, pending.final):
+            os.replace(temporary, final)
+        left_name, right_name = (path.name for path in pending.final)
         self._pair_count += 1
         self._last_left_timestamp = pair.left_timestamp_ns
         self._last_right_timestamp = pair.right_timestamp_ns
@@ -252,13 +322,10 @@ class DatasetWriter:
                 FORMAT_NAMES.get(pair.right_format, str(pair.right_format)),
             )
         )
-        for stream in (self._cam0_stream, self._cam1_stream, self._pairs_stream):
-            stream.flush()
-        elapsed_ns = time.perf_counter_ns() - start_ns
-        self._pair_write_total_ns += elapsed_ns
-        self._pair_write_max_ns = max(self._pair_write_max_ns, elapsed_ns)
+        self._camera_dirty = True
 
     def write_imu(self, record: ImuRecord) -> None:
+        self.raise_if_failed()
         if self._closed:
             raise RuntimeError("dataset writer is closed")
         with self._imu_lock:
@@ -277,13 +344,41 @@ class DatasetWriter:
                 json.dumps(record.to_json_dict(), separators=(",", ":"), ensure_ascii=False)
                 + "\n"
             )
-            self._imu_stream.flush()
-            self._imu_full_stream.flush()
+            self._imu_dirty = True
+
+    def raise_if_failed(self) -> None:
+        if self._flush_error is not None:
+            raise RuntimeError(f"metadata flush failed: {self._flush_error}") from self._flush_error
+
+    def flush_metadata(self) -> None:
+        start = time.perf_counter_ns()
+        with self._camera_lock:
+            if self._camera_dirty:
+                for stream in (self._cam0_stream, self._cam1_stream, self._pairs_stream):
+                    stream.flush()
+                self._camera_dirty = False
+        with self._imu_lock:
+            if self._imu_dirty:
+                self._imu_stream.flush()
+                self._imu_full_stream.flush()
+                self._imu_dirty = False
+        self.timings.add("metadata_flush", time.perf_counter_ns() - start)
+
+    def _flush_loop(self) -> None:
+        try:
+            while not self._flush_stop.wait(0.5):
+                self.flush_metadata()
+        except BaseException as exc:
+            self._flush_error = exc
 
     def _close_streams(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._image_executor.shutdown(wait=True)
+        self._flush_stop.set()
+        self._flush_thread.join()
+        close_error: BaseException | None = None
         for stream in (
             self._cam0_stream,
             self._cam1_stream,
@@ -291,8 +386,13 @@ class DatasetWriter:
             self._imu_stream,
             self._imu_full_stream,
         ):
-            stream.flush()
-            stream.close()
+            try:
+                stream.close()  # close flushes; still attempt every stream on error.
+            except BaseException as exc:
+                close_error = close_error or exc
+        if close_error is not None:
+            raise close_error
+        self.raise_if_failed()
 
     def seal_payload(self, session: Mapping[str, Any]) -> dict[str, Any]:
         self._close_streams()
@@ -306,6 +406,10 @@ class DatasetWriter:
             "pair_count": self._pair_count,
             "imu_count": self._imu_count,
             "config": self.config.to_dict(),
+            "image_writer_workers": self.config.image_workers,
+            "metadata_flush_interval_s": 0.5,
+            "image_stages": self.timings.summary(),
+            "peak_rss_bytes": peak_rss_bytes(),
             "ax_video_frame_abi": {
                 "base_size": AX_VIDEO_FRAME_BASE_SIZE,
                 "pts_offset": AxVideoFrame.u64PTS.offset,

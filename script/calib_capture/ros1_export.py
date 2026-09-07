@@ -8,7 +8,7 @@ from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .bmp import read_mono8_bmp
+from .image_io import read_mono8_image
 from .validator import validate_dataset
 
 
@@ -89,7 +89,7 @@ def _make_image(
     event: ExportEvent,
     frame_id: str,
 ) -> Any:
-    info, pixels = read_mono8_bmp(event.payload)
+    info, pixels = read_mono8_image(event.payload)
     image_type = _type(typestore, IMAGE_MSGTYPE)
     return _construct(
         image_type,

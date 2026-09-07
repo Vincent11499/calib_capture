@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from .bmp import inspect_mono8_bmp
+from .image_io import image_suffix, inspect_mono8_image
 from .config import DATASET_SCHEMA_VERSION, SDK_HEADER_SHA256
 
 
@@ -98,14 +98,30 @@ def validate_dataset(
         report.error("meta/session.json root is not an object")
         session = {}
     schema_version = session.get("schema_version")
-    if schema_version not in (1, DATASET_SCHEMA_VERSION):
+    if schema_version not in (1, 2, DATASET_SCHEMA_VERSION):
         report.error(f"unsupported dataset schema_version: {schema_version!r}")
-    if schema_version == DATASET_SCHEMA_VERSION and session.get("data_integrity") != "structural":
+    if schema_version in (2, DATASET_SCHEMA_VERSION) and session.get("data_integrity") != "structural":
         report.error("session data_integrity must be structural")
     config = session.get("config", {})
     if not isinstance(config, dict):
         report.error("meta/session.json config is not an object")
         config = {}
+    stored_format = config.get("image_format", "bmp") if schema_version == 3 else "bmp"
+    try:
+        suffix = image_suffix(stored_format)
+    except ValueError as exc:
+        report.error(str(exc))
+        suffix = ".bmp"
+    if stored_format == "jpeg":
+        report.warning("JPEG storage is lossy; exported mono8 pixels are decoded JPEG, not original pixels")
+    if schema_version == 3:
+        if "image_format" not in config:
+            report.error("missing image_format in session config")
+        try:
+            if not 1 <= int(config["jpeg_quality"]) <= 100:
+                raise ValueError("out of range")
+        except (KeyError, TypeError, ValueError):
+            report.error("invalid or missing jpeg_quality in session config")
     expected_abi = {"base_size": 232, "pts_offset": 192, "sequence_offset": 200}
     if session.get("ax_video_frame_abi") != expected_abi:
         report.error("session AX_VIDEO_FRAME_T ABI metadata does not match the pinned contract")
@@ -190,8 +206,14 @@ def validate_dataset(
         for required_line in required_yaml_lines:
             if required_line not in dataset_yaml:
                 report.error(f"dataset.yaml is missing contract entry: {required_line.strip()}")
-        if schema_version == DATASET_SCHEMA_VERSION and "data_integrity: structural" not in dataset_yaml:
+        if schema_version in (2, DATASET_SCHEMA_VERSION) and "data_integrity: structural" not in dataset_yaml:
             report.error("dataset.yaml is missing data_integrity: structural")
+        if schema_version == 3:
+            for line in (f"image_format: {stored_format}",
+                         f"jpeg_quality: {config.get('jpeg_quality')}",
+                         f"lossy: {'true' if stored_format == 'jpeg' else 'false'}"):
+                if line not in dataset_yaml.splitlines():
+                    report.error(f"dataset.yaml is missing contract entry: {line}")
         resolution_line = f"    resolution: [{expected_width}, {expected_height}]"
         if expected_width and expected_height and dataset_yaml.count(resolution_line) != 2:
             report.error("dataset.yaml camera resolutions disagree with session metadata")
@@ -350,7 +372,7 @@ def validate_dataset(
                 not filename
                 or "\x00" in filename
                 or Path(filename).name != filename
-                or not filename.endswith(".bmp")
+                or not filename.endswith(suffix)
             ):
                 report.error(f"unsafe or invalid {camera} filename: {filename!r}")
                 continue
@@ -371,8 +393,8 @@ def validate_dataset(
                 report.error(f"missing image: cameras/{camera}/{filename}")
                 continue
             try:
-                info = inspect_mono8_bmp(path)
-            except (OSError, ValueError) as exc:
+                info = inspect_mono8_image(path)
+            except (OSError, ValueError, RuntimeError) as exc:
                 report.error(f"invalid image cameras/{camera}/{filename}: {exc}")
                 continue
             if expected_width and expected_height and (
@@ -382,10 +404,11 @@ def validate_dataset(
                     f"wrong image resolution cameras/{camera}/{filename}: "
                     f"{info.width}x{info.height}"
                 )
-        actual = {path.name for path in (dataset / "cameras" / camera).glob("*.bmp")}
+        actual = {path.name for path in (dataset / "cameras" / camera).iterdir()
+                  if path.suffix.lower() in {".bmp", ".jpg", ".jpeg"}}
         extras = sorted(actual - referenced[camera])
         if extras:
-            report.error(f"unreferenced {camera} BMP files: {', '.join(extras[:5])}")
+            report.error(f"unreferenced {camera} image files: {', '.join(extras[:5])}")
 
     temporary_files = [
         path.relative_to(dataset).as_posix()

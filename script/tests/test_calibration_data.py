@@ -10,6 +10,7 @@ import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from calib_capture.axera import (
@@ -108,12 +109,12 @@ def make_grabber(api: FakeVinApi, tolerance_us: int = 5) -> StereoGrabber:
     )
 
 
-def create_dataset(root: Path, mode: str = "camera-imu") -> Path:
+def create_dataset(root: Path, mode: str = "camera-imu", image_format: str = "bmp") -> Path:
     output = root / "dataset"
     config = build_capture_config(
         mode=mode,
         output=str(output),
-        overrides={"resolution": "1920x1080", "save_rate_hz": 10.0},
+        overrides={"resolution": "1920x1080", "save_rate_hz": 10.0, "image_format": image_format},
     )
     object.__setattr__(config, "width", 5)
     object.__setattr__(config, "height", 3)
@@ -648,11 +649,18 @@ class QueueTests(unittest.TestCase):
         class SlowDataset:
             def __init__(self) -> None:
                 self.items: list[GrayPair] = []
+                self.config = SimpleNamespace(image_workers=2, width=5, height=3)
 
-            def write_pair(self, pair: GrayPair) -> None:
+            def raise_if_failed(self):
+                pass
+
+            def start_pair(self, pair):
+                return SimpleNamespace(pair=pair, done=lambda: True)
+
+            def finish_pair(self, job) -> None:
                 entered.set()
                 release.wait(2.0)
-                self.items.append(pair)
+                self.items.append(job.pair)
 
         dataset = SlowDataset()
         writer = PairDiskWriter(dataset, capacity=1)  # type: ignore[arg-type]
@@ -666,14 +674,19 @@ class QueueTests(unittest.TestCase):
 
     def test_failed_writer_finish_is_idempotent(self) -> None:
         class BrokenDataset:
-            def write_pair(self, pair: GrayPair) -> None:
+            config = SimpleNamespace(image_workers=2, width=5, height=3)
+
+            def raise_if_failed(self):
+                pass
+
+            def start_pair(self, pair):
                 raise OSError("simulated disk failure")
 
         writer = PairDiskWriter(BrokenDataset(), capacity=1)  # type: ignore[arg-type]
         self.assertTrue(writer.submit(make_pair(0)))
-        with self.assertRaisesRegex(RuntimeError, "BMP writer failed"):
+        with self.assertRaisesRegex(RuntimeError, "image writer failed"):
             writer.finish()
-        with self.assertRaisesRegex(RuntimeError, "BMP writer failed"):
+        with self.assertRaisesRegex(RuntimeError, "image writer failed"):
             writer.finish()
 
     def test_rate_limiter_uses_source_timestamps(self) -> None:
@@ -759,7 +772,7 @@ class DatasetTests(unittest.TestCase):
             self.assertEqual(report.stats["cam0_count"], 2)
             self.assertEqual(report.stats["imu_count"], 12)
             contract = (dataset / "dataset.yaml").read_text(encoding="utf-8")
-            self.assertIn("schema_version: 2", contract)
+            self.assertIn("schema_version: 3", contract)
             self.assertIn("data_integrity: structural", contract)
             self.assertIn("capture_api: AX_VIN_GetYuvFrame", contract)
             self.assertIn("vin: {pipe: 2, chn: 0}", contract)
@@ -809,7 +822,7 @@ class DatasetTests(unittest.TestCase):
             contract_path = dataset / "dataset.yaml"
             contract_path.write_text(
                 contract_path.read_text(encoding="utf-8")
-                .replace("schema_version: 2", "schema_version: 1")
+                .replace("schema_version: 3", "schema_version: 1")
                 .replace("data_integrity: structural\n", ""),
                 encoding="utf-8",
             )

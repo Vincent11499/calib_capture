@@ -8,7 +8,7 @@
 - [项目 Agent 维护规范](../AGENTS.md)：后续 Agent 修改代码时必须遵守的硬件、ABI、数据与测试契约。工程只保留这一份顶层 Agent 文档。
 - [AXERA VIN/ABI 约束](./AXERA_IVPS.md)：VIN 获取、物理映射、完整帧释放和 SDK ABI。
 - [目录数据集格式](./DATASET_FORMAT.md)：文件、CSV、时间戳和 ROS1 bag 映射。
-- [板端验证记录](./BOARD_VALIDATION.md)：默认 5 Hz、60 秒双目–IMU 实测，以及 v1.6.0 INI 配置回归。
+- [板端验证记录](./BOARD_VALIDATION.md)：5 Hz 采集、INI 配置与 OpenCV JPEG95 的板端实测和测试范围。
 
 板端部署目标为 `/workspace/minsky/Vincent/calib_capture`；对应宿主机目录是 `/workspace/test/Vincent/calib_capture`。SSH、SCP 和 Docker 进入步骤及授权边界见《使用操作说明》和顶层 `AGENTS.md`。
 
@@ -18,11 +18,11 @@
 - 标定（cali）默认映射为 `cam0=左目=VIN pipe 2/chn 0`、`cam1=右目=VIN pipe 0/chn 0`，接口为 `AX_VIN_GetYuvFrame`，源格式必须为 NV12。
 - 录制期间不要让其他消费者竞争读取相同的 VIN pipe/chn 输出队列。
 - 板端运行库默认为 `/soc/lib`；运行前设置 `BSP_MSP_DIR=/soc/lib` 和 `LD_LIBRARY_PATH=/soc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}`，脚本同时按依赖顺序加载现有 AX 库。随后调用 `AX_SYS_Init`、`AX_VIN_Init`，退出时反向释放当前 Python 消费者上下文。
-- 默认双目 5 Hz、60 秒，mono8 图像在 4K 下约 5 GB、1080p 下约 1.25 GB。本工具不做容量或写速准入检查；写盘队列满时会成对丢弃左右图并写入质量报告。
+- 默认双目 5 Hz、60 秒，BMP 图像在 4K 下约 5 GB、1080p 下约 1.25 GB。可选 JPEG quality 95 减小体积，实际大小依画面而定。本工具不做容量或写速准入检查；写盘队列满时成对丢弃左右图。
 
 ## 依赖与部署
 
-以下命令默认从项目顶层执行。板端使用现有环境，不安装新包或库。INI 配置由 Python 标准库 `configparser` 读取，无需 PyYAML；`script/requirements-capture.txt` 仅列出可选的 NumPy 灰度转换加速依赖。
+以下命令默认从项目顶层执行。板端使用现有环境，不安装新包或库。INI 配置由标准库 `configparser` 读取；JPEG 需要现有 OpenCV/NumPy，BMP 可不依赖二者。依赖清单供另行准备 PC 环境参考，不要求重装板端现有包。
 
 只有 `camera-imu` 和 `probe --with-imu` 需要先 source 与 IMU 发布端一致的 ROS 2 环境；纯双目采集、校验和 bag 导出不依赖 ROS 2：
 
@@ -115,6 +115,14 @@ python3 script/calibration_data.py export-ros1 \
 录制、结束收尾、校验与导出均不计算数据文件 SHA-256。导出前检查 BMP 格式/尺寸、CSV 配对与时间戳；导出后再打开 bag，逐话题核对消息类型、数量、首尾时间戳、单调性以及 Header stamp 与 bag record time 是否完全相同。实现基于 [rosbags 0.11 ROS1 Writer](https://ternaris.gitlab.io/rosbags/topics/rosbag1.html)。
 只有诊断损坏数据时才使用 `--force-dataset`；默认情况下任何硬校验错误都会阻止交付 bag。
 
+## JPEG 可选输出
+
+v1.8 使用有界缓冲复用和按双目对有序提交的图像线程池。`image_workers`／`--image-workers` 默认 2，允许 1–8；默认 5 Hz 保持不变。CSV/IMU JSONL 每 0.5 秒批量刷新、退出时最终刷新；强杀或断电可能丢失尚未刷新的记录。详细性能字段与高频探索方式见操作说明。
+
+INI `[capture]` 中设置 `image_format = jpeg`、`jpeg_quality = 95`，或在采集子命令后加 `--image-format jpeg --jpeg-quality 95`。默认仍为 BMP，质量范围 1–100。
+
+JPEG 保存单通道有损灰度 JPG，尺寸与时间戳不变；直接使用 OpenCV/NumPy，不使用 Pillow，板端不安装新包。校验完整解码 JPEG；bag 导出生成解码后的 mono8，不能恢复原像素。详见操作说明“JPEG 压缩保存”。
+
 ## INI 配置
 
 模板为 `script/default_config.ini`，使用 Python 标准库 `configparser`，无需额外依赖。`--config` 必须放在子命令前，配置优先级为“命令行 > INI `[capture]` > 内置默认值”：
@@ -136,8 +144,8 @@ python3 script/calibration_data.py --config script/default_config.ini camera-imu
 - 录制中的临时目录：时间戳目录使用 `.inprogress` 后缀。
 - `validation.json` 的 `status` 为 `pass`、`warning` 或 `fail`。队列丢帧、低实际频率及源序号缺口为警告；单侧缺失、时间倒退、同步超限、损坏 BMP、无 IMU 或时钟域不一致为失败。
 - 正常和失败数据集都会生成 `validation.json`；失败数据不会被静默删除。连续模式按源 PTS 统计真实取帧率和源序号缺口，保存降频造成的序号跳变不会误报为上游丢帧。
-- schema 2 使用 `data_integrity: structural`，不生成校验和清单；旧 schema 1 数据也可读取，旧清单会被忽略。等长度像素变化不再检测，截断文件、单侧缺失及错误尺寸仍会失败。
-- BMP 保留原 bottom-up 格式，改为大块写入。`meta/session.json` 的 `write_performance.mean_pair_ms`、`max_pair_ms` 记录每对真实写入耗时，不含取帧、队列等待或 `fsync`。
+- schema 3 使用 `data_integrity: structural`，记录图像格式/质量/有损标记，不生成校验和清单；旧 schema 1/2 的 BMP 数据仍可读取。JPEG 完整解码校验，不保证检测所有可解码的像素变化。
+- BMP 保留原 bottom-up 格式并直接写入复用缓冲。`write_performance` 记录从图像任务提交到有序提交结束的每对延迟（含线程池/顺序等待，不含输入队列等待、取帧和 fsync）；多对重叠时累计延迟不是录制时长。分阶段耗时、缓冲/队列高水位、RSS 和校验时间另行记录。
 - 板端找不到 SDK 头文件时仍会执行固定 ctypes ABI 检查并给出质量警告。要完成严格的哈希验收，请复制对应 SDK `include` 目录并传入 `--sdk-include-dir /path/to/include`。
 
 ## 无硬件自检

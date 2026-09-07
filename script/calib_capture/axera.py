@@ -3,11 +3,13 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .config import SDK_HEADER_SHA256
+from .performance import Timings
 
 
 AX_FORMAT_YUV400 = 0x0
@@ -614,6 +616,28 @@ def packed_frame_to_gray(raw: bytes, width: int, height: int, stride: int, image
         return _gray_without_numpy(raw[:required], width, height, stride, image_format)
 
 
+def copy_y_plane(pointer: int, width: int, height: int, stride: int,
+                 destination: bytearray, bottom_up: bool = False) -> None:
+    """Copy mapped Y pixels once; no view of SDK memory escapes this function."""
+    if width <= 0 or height <= 0 or stride < width or len(destination) != width * height:
+        raise ValueError("invalid Y plane or destination dimensions")
+    address = ctypes.addressof(ctypes.c_ubyte.from_buffer(destination))
+    if stride == width and not bottom_up:
+        ctypes.memmove(address, pointer, width * height)
+        return
+    try:
+        import numpy as np
+    except ImportError:
+        for row in range(height):
+            target_row = height - 1 - row if bottom_up else row
+            ctypes.memmove(address + target_row * width, pointer + row * stride, width)
+    else:
+        mapped = (ctypes.c_ubyte * (stride * height)).from_address(pointer)
+        source = np.frombuffer(mapped, dtype=np.uint8).reshape(height, stride)[:, :width]
+        target = np.frombuffer(destination, dtype=np.uint8).reshape(height, width)
+        np.copyto(target, source[::-1] if bottom_up else source)
+
+
 @dataclass(frozen=True)
 class GrayPair:
     left_timestamp_ns: int
@@ -622,10 +646,11 @@ class GrayPair:
     right_sequence: int
     width: int
     height: int
-    left_pixels: bytes
-    right_pixels: bytes
+    left_pixels: bytes | bytearray
+    right_pixels: bytes | bytearray
     left_format: int
     right_format: int
+    bottom_up: bool = False
 
     @property
     def pair_timestamp_ns(self) -> int:
@@ -669,6 +694,7 @@ class StereoGrabber:
         self.max_retries = max_retries
         self.expected_resolution = expected_resolution
         self.expected_format = expected_format
+        self.timings = Timings()
         self.stats: dict[str, int] = {
             "get_left_calls": 0,
             "get_right_calls": 0,
@@ -706,6 +732,7 @@ class StereoGrabber:
             )
 
     def grab_frames(self) -> StereoFrames:
+        started = time.perf_counter_ns()
         left: AxVideoFrame | None = None
         right: AxVideoFrame | None = None
         try:
@@ -759,6 +786,8 @@ class StereoGrabber:
             if release_error is not None:
                 raise release_error
             raise
+        finally:
+            self.timings.add("grab_and_sync", time.perf_counter_ns() - started)
 
     def release_frames(self, frames: StereoFrames) -> None:
         if frames.released:
@@ -777,49 +806,55 @@ class StereoGrabber:
             raise RuntimeError("; ".join(str(error) for error in errors))
 
     def copy_gray_pair(
-        self, frames: StereoFrames, *, release_after_copy: bool = False
+        self, frames: StereoFrames, *, release_after_copy: bool = False,
+        buffers: tuple[bytearray, bytearray] | None = None,
+        bottom_up: bool = False,
     ) -> GrayPair:
-        def copy_raw(frame: AxVideoFrame) -> bytes:
+        width, height = int(frames.left.u32Width), int(frames.left.u32Height)
+        def copy_gray(frame: AxVideoFrame, destination: bytearray) -> bytearray:
+            start = time.perf_counter_ns()
             pointer, map_size, mapped_here = self.api.map_frame(frame)
+            self.timings.add("map_and_invalidate", time.perf_counter_ns() - start)
             try:
-                return ctypes.string_at(
-                    pointer, int(frame.u32PicStride[0]) * int(frame.u32Height)
-                )
+                start = time.perf_counter_ns()
+                stride, image_format = int(frame.u32PicStride[0]), int(frame.enImgFormat)
+                if image_format in (AX_FORMAT_RGB888, AX_FORMAT_BGR888):
+                    raw = ctypes.string_at(pointer, stride * height)
+                    gray = packed_frame_to_gray(raw, width, height, stride, image_format)
+                    if bottom_up:
+                        for row in range(height):
+                            offset = (height - 1 - row) * width
+                            destination[row * width:(row + 1) * width] = gray[offset:offset + width]
+                    else:
+                        destination[:] = gray
+                else:
+                    copy_y_plane(pointer, width, height, stride, destination, bottom_up)
+                self.timings.add("copy_y", time.perf_counter_ns() - start)
+                return destination
             finally:
+                start = time.perf_counter_ns()
                 self.api.unmap_frame(pointer, map_size, mapped_here)
+                self.timings.add("unmap", time.perf_counter_ns() - start)
 
-        # Each SDK mapping is released immediately after copying into Python-owned
-        # bytes. Capture paths also release the VIN frames before CPU conversion.
+        # Allocation and copy failures are also covered by the frame-release path.
         try:
-            left_raw = copy_raw(frames.left)
-            right_raw = copy_raw(frames.right)
-            left_stride = int(frames.left.u32PicStride[0])
-            right_stride = int(frames.right.u32PicStride[0])
-            height = int(frames.left.u32Height)
-            width = int(frames.left.u32Width)
-            left_format = int(frames.left.enImgFormat)
-            right_format = int(frames.right.enImgFormat)
-            left_timestamp_ns = int(frames.left.u64PTS) * 1000
-            right_timestamp_ns = int(frames.right.u64PTS) * 1000
-            left_sequence = int(frames.left.u64SeqNum)
-            right_sequence = int(frames.right.u64SeqNum)
+            if buffers is None:
+                buffers = (bytearray(width * height), bytearray(width * height))
+            return GrayPair(
+                left_timestamp_ns=int(frames.left.u64PTS) * 1000,
+                right_timestamp_ns=int(frames.right.u64PTS) * 1000,
+                left_sequence=int(frames.left.u64SeqNum),
+                right_sequence=int(frames.right.u64SeqNum),
+                width=width, height=height,
+                left_pixels=copy_gray(frames.left, buffers[0]),
+                right_pixels=copy_gray(frames.right, buffers[1]),
+                left_format=int(frames.left.enImgFormat),
+                right_format=int(frames.right.enImgFormat),
+                bottom_up=bottom_up,
+            )
         finally:
             if release_after_copy:
                 self.release_frames(frames)
-        left_pixels = packed_frame_to_gray(left_raw, width, height, left_stride, left_format)
-        right_pixels = packed_frame_to_gray(right_raw, width, height, right_stride, right_format)
-        return GrayPair(
-            left_timestamp_ns=left_timestamp_ns,
-            right_timestamp_ns=right_timestamp_ns,
-            left_sequence=left_sequence,
-            right_sequence=right_sequence,
-            width=width,
-            height=height,
-            left_pixels=left_pixels,
-            right_pixels=right_pixels,
-            left_format=left_format,
-            right_format=right_format,
-        )
 
     def describe_frames(self, frames: StereoFrames) -> dict[str, Any]:
         def one(frame: AxVideoFrame) -> dict[str, Any]:

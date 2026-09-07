@@ -35,9 +35,9 @@
 
 - `cam0` 始终是左目，`cam1` 始终是右目。
 - 默认左目 pipe 2/chn 0、右目 pipe 0/chn 0，CLI 可显式覆盖。
-- 标定输入必须为 NV12，落盘图像为无损 `mono8` BMP。
+- 标定输入必须为 NV12，落盘默认无损 `mono8` BMP；可配置 `image_format = jpeg`、`jpeg_quality = 95` 保存有损灰度 JPG。质量范围 1–100；JPEG 只使用 OpenCV/NumPy，不使用 Pillow，不自动安装板端依赖，不缩放图像。
 - 数据文件不计算 SHA-256，录制、结束收尾、离线校验和 bag 导出都只做结构与时序检查。BMP 按原 bottom-up 布局大块写入；不生成 `meta/checksums.sha256`。SDK 启动契约哈希不属于逐帧数据处理，仍保留。
-- 使用 `u64PhyAddr[0]` 调用 `AX_SYS_MmapCache`；缓存失效后复制 Y 平面到 Python 内存，再立即 Munmap 并释放 SDK 帧。不得解引用其他进程的 `u64VirAddr`。
+- 使用 `u64PhyAddr[0]` 调用 `AX_SYS_MmapCache`；缓存失效后直接复制有效 Y 平面到 Python 自有缓冲区，再立即 Munmap 并释放 SDK 帧。BMP 在复制时形成 bottom-up 行序，JPEG 保持 top-down。不得解引用其他进程的 `u64VirAddr`，不得让 SDK 映射或帧进入编码线程。
 - `AX_VIN_GetYuvFrame` 获取完整 `AX_IMG_INFO_T`，必须把同一个对象交回原 pipe/chn 的 `AX_VIN_ReleaseYuvFrame`。每个成功获取的帧只释放一次。
 - 左右 PTS 差默认不超过 2000 µs；超限时仅重取较早侧，最多 10 次。
 - 相机时间戳使用各自 `u64PTS × 1000` ns；IMU 使用原始 `header.stamp`。
@@ -78,8 +78,11 @@
 - 旧的自定义 YAML/JSON 配置需转换内容，不能只改扩展名。目录数据契约中的 `dataset.yaml` 和 JSON 元数据保持不变；`dataset.yaml` 写入与校验不依赖 PyYAML。
 - 新配置项必须同步修改默认配置、数据类、CLI、会话元数据、文档和测试。
 - 不得静默改变左右目含义、时间单位、目录 schema 或默认话题。
-- 当前数据集为 schema 2，标记 `data_integrity: structural`；读取时兼容 schema 1，忽略旧数据的校验和清单。同长度像素变化不再由校验器检测。
-- `meta/session.json` 的 `write_performance` 记录每对 BMP 与 CSV 提交的平均、最大及累计耗时；不包括取帧、排队等待或 `fsync`。
+- 当前数据集为 schema 3，记录 image_format、jpeg_quality 和 lossy；读取时兼容 schema 1/2 的 BMP 数据，忽略旧校验和清单。JPEG 检查首尾标志并完整解码、核验单通道和尺寸，不保证发现所有可解码的像素损坏。bag 导出使用解码后的 mono8，不能恢复 JPEG 压缩前像素。
+- `image_workers`／`--image-workers` 默认 2，允许 1–8，BMP/JPEG 共用一个复用线程池。每图一个任务，同时处理最多 `ceil(image_workers/2)` 对；协调线程按提交顺序成对提交文件和 CSV。
+- 默认等待队列容量 2 对。缓冲池按需分配，容量为等待队列 + 同时处理对数 + 1 个生产者槽位；满时在映射前整对丢弃。成功入队才转移缓冲所有权，所有成功/失败任务结束后才能归还，禁止无限积压。
+- CSV/IMU JSONL 每 0.5 秒批量刷新，正常停止和可处理异常退出时最终刷新，不逐帧 fsync。进程强杀或断电可能丢失尚未刷新的记录；后台刷新异常必须传播为录制失败。
+- `write_performance` 保留每对从图像任务提交到有序提交完成的延迟统计；包含线程池/顺序等待，不包含输入等待队列、取帧或 fsync。多对重叠时累计延迟不是总录制时间。`capture_stages`、`image_stages`、`capture_stats.pipeline` 分别记录取帧/复制、编码/写入/元数据、排队/容量/排空；另记录峰值 RSS 和校验时间。统计只用固定大小累计计数器。
 - 仅 `camera-imu` 和 `probe --with-imu` 可以依赖 ROS 2 Python 环境。
 - 写盘队列满时只丢弃完整双目对，并记录 AX 错误、源序号缺口、分频/限频跳过数及队列丢弃数。
 - 不做磁盘容量或写速硬准入；4K 数据量只提示。

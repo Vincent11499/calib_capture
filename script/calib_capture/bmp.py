@@ -28,6 +28,7 @@ def write_mono8_bmp(
     width: int,
     height: int,
     pixels: bytes | bytearray | memoryview,
+    bottom_up: bool = False,
 ) -> None:
     """Write a bottom-up mono8 BMP in large blocks, without payload hashing."""
 
@@ -61,10 +62,12 @@ def write_mono8_bmp(
     target.parent.mkdir(parents=True, exist_ok=True)
     # Keep the existing byte layout, including row padding, while reducing
     # thousands of per-row file writes to one header and one pixel-block write.
-    if padding:
+    if bottom_up and not padding:
+        payload = view
+    elif padding:
         payload = b"".join(
             bytes(view[row * width : (row + 1) * width]) + padding
-            for row in range(height - 1, -1, -1)
+            for row in (range(height) if bottom_up else range(height - 1, -1, -1))
         )
     else:
         payload = b"".join(

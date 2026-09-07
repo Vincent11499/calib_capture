@@ -44,6 +44,9 @@ def _add_capture_options(
     parser.add_argument("--right-pipe", type=int, default=None)
     parser.add_argument("--right-chn", type=int, default=None)
     parser.add_argument("--resolution", default=None, metavar="WIDTHxHEIGHT")
+    parser.add_argument("--image-format", choices=("bmp", "jpeg"), default=None)
+    parser.add_argument("--image-workers", type=int, default=None, help="image worker threads, 1..8 (default: 2)")
+    parser.add_argument("--jpeg-quality", type=int, default=None, help="JPEG quality 1..100 (default: 95)")
     parser.add_argument("--expected-source-rate-hz", type=float, default=None)
     if continuous:
         rate_control = parser.add_mutually_exclusive_group()
