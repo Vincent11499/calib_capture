@@ -21,7 +21,10 @@ from .axera import (
     GrayPair,
 )
 from .image_io import ensure_image_support, image_suffix, write_mono8_image
-from .config import APP_VERSION, DATASET_SCHEMA_VERSION, CaptureConfig, SDK_HEADER_SHA256
+from .config import (
+    APP_VERSION, CAPTURE_LAYOUT, DATASET_SCHEMA_VERSION, KALIBR_MANIFEST_MARKER,
+    KALIBR_MANIFEST_VERSION, CaptureConfig, SDK_HEADER_SHA256,
+)
 from .performance import Timings, peak_rss_bytes
 
 
@@ -49,6 +52,8 @@ class ImuRecord:
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "kind": "imu_message",
             "timestamp_ns": self.timestamp_ns,
             "frame_id": self.frame_id,
             "orientation": {
@@ -82,9 +87,53 @@ def _yaml_scalar(value: Any) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def write_dataset_yaml(path: Path, config: CaptureConfig, include_imu: bool) -> None:
+def kalibr_manifest(
+    config: Mapping[str, Any], include_imu: bool, *, dataset_id: str | None = None,
+    imu_frame_id: str | None = None,
+) -> dict[str, Any]:
+    """Shared v1.0.0 contract; frame_id is the effective sensor frame."""
+    return {
+        "schema_version": KALIBR_MANIFEST_VERSION,
+        "type": "kalibr_directory_dataset",
+        "dataset_id": dataset_id or Path(config["output"]).name,
+        "cameras": [
+            {"id": camera,
+             "timestamps": f"cameras/{camera}/timestamps.csv", "images": f"cameras/{camera}",
+             "frame_id": config[f"{side}_frame_id"],
+             "resolution": [config["width"], config["height"]], "clock_source": "axera_pts_us"}
+            for camera, side in (("cam0", "left"), ("cam1", "right"))
+        ],
+        "imus": ([{"id": "imu0", "data": "imu/imu0.csv",
+                   "frame_id": imu_frame_id if imu_frame_id is not None else config["imu_frame_id"],
+                   "clock_source": "ros_header_stamp", "angular_velocity_unit": "rad/s",
+                   "linear_acceleration_unit": "m/s^2"}]
+                 if include_imu else []),
+    }
+
+
+def write_dataset_yaml(
+    path: Path, config: CaptureConfig, include_imu: bool, *, dataset_id: str,
+    imu_frame_id: str,
+) -> None:
+    # JSON is a YAML subset accepted by Kalibr. Using it keeps strict parsing
+    # dependency-free and avoids a second, partial YAML parser in this project.
+    _atomic_write_text(path, json.dumps(kalibr_manifest(config.to_dict(), include_imu,
+                                       dataset_id=dataset_id, imu_frame_id=imu_frame_id),
+                                       indent=2, ensure_ascii=False) + "\n")
+
+
+def write_capture_dataset_yaml(
+    path: Path, config: CaptureConfig, include_imu: bool, imu_frame_id: str,
+) -> None:
+    _atomic_write_text(path, capture_dataset_yaml(config, include_imu, imu_frame_id))
+
+
+def capture_dataset_yaml(
+    config: CaptureConfig, include_imu: bool, imu_frame_id: str,
+) -> str:
     lines = [
         f"schema_version: {DATASET_SCHEMA_VERSION}",
+        "kind: capture_dataset",
         "data_integrity: structural",
         "dataset_type: calibration",
         "timestamp_unit: ns",
@@ -114,11 +163,11 @@ def write_dataset_yaml(path: Path, config: CaptureConfig, include_imu: bool) -> 
         "imu:",
         f"  enabled: {_yaml_scalar(include_imu)}",
         f"  topic: {_yaml_scalar(config.imu_topic)}",
-        f"  frame_id: {_yaml_scalar(config.imu_frame_id)}",
-        "  measurements: imu/imu0.csv",
-        "  full_messages: meta/imu_full.jsonl",
+        f"  frame_id: {_yaml_scalar(imu_frame_id)}",
+        "  measurements: imu/imu0.csv" if include_imu else "  measurements: null",
+        "  full_messages: meta/imu_full.jsonl" if include_imu else "  full_messages: null",
     ]
-    _atomic_write_text(path, "\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"
 
 
 @dataclass
@@ -153,7 +202,10 @@ class DatasetWriter:
         ):
             raise FileExistsError(f"dataset output already exists: {self.final_path}")
         self.staging_path.parent.mkdir(parents=True, exist_ok=True)
-        for relative in ("cameras/cam0", "cameras/cam1", "imu", "meta"):
+        directories = ["cameras/cam0", "cameras/cam1", "meta"]
+        if include_imu:
+            directories.append("imu")
+        for relative in directories:
             (self.staging_path / relative).mkdir(parents=True, exist_ok=False)
 
         self.config = config
@@ -165,6 +217,10 @@ class DatasetWriter:
         self._last_left_timestamp = -1
         self._last_right_timestamp = -1
         self._last_imu_timestamp = -1
+        self._first_imu_timestamp: int | None = None
+        self._first_camera_timestamp: int | None = None
+        self._effective_imu_frame_id: str | None = None
+        self._imu_empty_frame_id_count = 0
         self._last_submitted_left = -1
         self._last_submitted_right = -1
         self._pair_write_total_ns = 0
@@ -188,14 +244,14 @@ class DatasetWriter:
         )
         self._imu_stream = (self.staging_path / "imu/imu0.csv").open(
             "w", encoding="utf-8", newline=""
-        )
+        ) if include_imu else None
         self._imu_full_stream = (self.staging_path / "meta/imu_full.jsonl").open(
             "w", encoding="utf-8", newline="\n"
-        )
+        ) if include_imu else None
         self._cam0_writer = csv.writer(self._cam0_stream)
         self._cam1_writer = csv.writer(self._cam1_stream)
         self._pairs_writer = csv.writer(self._pairs_stream)
-        self._imu_writer = csv.writer(self._imu_stream)
+        self._imu_writer = csv.writer(self._imu_stream) if include_imu else None
         self._cam0_writer.writerow(("timestamp_ns", "filename"))
         self._cam1_writer.writerow(("timestamp_ns", "filename"))
         self._pairs_writer.writerow(
@@ -210,9 +266,8 @@ class DatasetWriter:
                 "right_format",
             )
         )
-        self._imu_writer.writerow(
-            ("timestamp_ns", "gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z")
-        )
+        if self._imu_writer is not None:
+            self._imu_writer.writerow(("timestamp_ns", "wx", "wy", "wz", "ax", "ay", "az"))
         self._image_executor = ThreadPoolExecutor(
             max_workers=config.image_workers, thread_name_prefix="image")
         self._flush_thread = threading.Thread(target=self._flush_loop,
@@ -226,6 +281,20 @@ class DatasetWriter:
     @property
     def imu_count(self) -> int:
         return self._imu_count
+
+    @property
+    def first_camera_timestamp_ns(self) -> int | None:
+        return self._first_camera_timestamp
+
+    @property
+    def last_camera_timestamp_ns(self) -> int | None:
+        if not self._pair_count:
+            return None
+        return max(self._last_left_timestamp, self._last_right_timestamp)
+
+    @property
+    def effective_imu_frame_id(self) -> str:
+        return self._effective_imu_frame_id or self.config.imu_frame_id
 
     def write_pair(self, pair: GrayPair) -> None:
         """Synchronous convenience path for triggered capture and offline tests."""
@@ -323,14 +392,29 @@ class DatasetWriter:
             )
         )
         self._camera_dirty = True
+        if self._first_camera_timestamp is None:
+            self._first_camera_timestamp = min(pair.left_timestamp_ns, pair.right_timestamp_ns)
 
     def write_imu(self, record: ImuRecord) -> None:
         self.raise_if_failed()
+        if not self.include_imu:
+            raise RuntimeError("cannot write IMU messages to a stereo-only dataset")
         if self._closed:
             raise RuntimeError("dataset writer is closed")
         with self._imu_lock:
             if record.timestamp_ns <= self._last_imu_timestamp:
                 raise ValueError("IMU timestamp is not strictly increasing")
+            if not isinstance(record.frame_id, str):
+                raise ValueError("IMU frame_id must be a string")
+            effective_id = record.frame_id or self.config.imu_frame_id
+            if self._effective_imu_frame_id is not None and effective_id != self._effective_imu_frame_id:
+                raise ValueError(
+                    f"IMU effective frame_id changed: {self._effective_imu_frame_id!r} -> {effective_id!r}"
+                )
+            self._effective_imu_frame_id = effective_id
+            self._imu_empty_frame_id_count += int(not record.frame_id)
+            if self._first_imu_timestamp is None:
+                self._first_imu_timestamp = record.timestamp_ns
             self._last_imu_timestamp = record.timestamp_ns
             self._imu_count += 1
             self._imu_writer.writerow(
@@ -386,6 +470,8 @@ class DatasetWriter:
             self._imu_stream,
             self._imu_full_stream,
         ):
+            if stream is None:
+                continue
             try:
                 stream.close()  # close flushes; still attempt every stream on error.
             except BaseException as exc:
@@ -396,9 +482,14 @@ class DatasetWriter:
 
     def seal_payload(self, session: Mapping[str, Any]) -> dict[str, Any]:
         self._close_streams()
-        write_dataset_yaml(self.staging_path / "dataset.yaml", self.config, self.include_imu)
+        write_capture_dataset_yaml(self.staging_path / "meta/capture_dataset.yaml", self.config,
+                                   self.include_imu, self.effective_imu_frame_id)
+        write_dataset_yaml(self.staging_path / "dataset.yaml", self.config, self.include_imu,
+                           dataset_id=self.final_path.name, imu_frame_id=self.effective_imu_frame_id)
         session_data = {
             "schema_version": DATASET_SCHEMA_VERSION,
+            "kind": "capture_session",
+            "dataset_id": self.final_path.name,
             "data_integrity": "structural",
             "app_version": APP_VERSION,
             "created_utc": self.created_utc,
@@ -422,6 +513,22 @@ class DatasetWriter:
             },
             "pinned_sdk_header_sha256": SDK_HEADER_SHA256,
             **dict(session),
+            "dataset_manifest": KALIBR_MANIFEST_MARKER,
+            "capture_layout": CAPTURE_LAYOUT,
+            "imu_frame_id": self.effective_imu_frame_id,
+            "imu_empty_frame_id_count": self._imu_empty_frame_id_count,
+            "camera_first_timestamp_ns": self.first_camera_timestamp_ns,
+            "camera_last_timestamp_ns": self.last_camera_timestamp_ns,
+            "imu_preroll_actual_s": (
+                (self.first_camera_timestamp_ns - self._first_imu_timestamp) / 1e9
+                if self.first_camera_timestamp_ns is not None and self._first_imu_timestamp is not None
+                else None
+            ),
+            "imu_postroll_actual_s": (
+                (self._last_imu_timestamp - self.last_camera_timestamp_ns) / 1e9
+                if self.last_camera_timestamp_ns is not None and self._first_imu_timestamp is not None
+                else None
+            ),
             "write_performance": {
                 "pair_count": self._pair_count,
                 "mean_pair_ms": (
@@ -473,6 +580,12 @@ class DatasetWriter:
         except Exception as seal_error:
             self._close_streams()
             session_data = {
+                "schema_version": DATASET_SCHEMA_VERSION,
+                "kind": "capture_session",
+                "dataset_id": self.final_path.name,
+                "app_version": APP_VERSION,
+                "config": self.config.to_dict(),
+                "capture_layout": CAPTURE_LAYOUT,
                 "capture_status": "failed",
                 "error": f"{type(error).__name__}: {error}",
                 "seal_error": f"{type(seal_error).__name__}: {seal_error}",

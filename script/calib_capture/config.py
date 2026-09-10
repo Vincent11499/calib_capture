@@ -3,16 +3,20 @@ from __future__ import annotations
 import configparser
 import math
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
 
-APP_VERSION = "1.8.0"
-DATASET_SCHEMA_VERSION = 3
+APP_VERSION = "1.0.0"
+DATASET_SCHEMA_VERSION = APP_VERSION
+KALIBR_MANIFEST_VERSION = APP_VERSION
+KALIBR_MANIFEST_MARKER = "kalibr_directory_dataset"
+CAPTURE_LAYOUT = "compact"
 NS_PER_SECOND = 1_000_000_000
-SESSION_DIRECTORY_FORMAT = "%Y-%m-%d_%H-%M-%S"
+SESSION_DIRECTORY_FORMAT = "%y%m%d_%H%M"
 
 AUTHORITATIVE_SDK_INCLUDE = Path(
     r"D:\tool\mipi_tools\sensor_timing_check_tool\bsp_sdk\include"
@@ -31,6 +35,8 @@ SDK_HEADER_SHA256 = {
 
 
 DEFAULTS: dict[str, Any] = {
+    "schema_version": APP_VERSION,
+    "dataset_name": "",
     "ax_lib_dir": "/soc/lib",
     "sdk_include_dir": "",
     "left_pipe": 2,
@@ -46,14 +52,17 @@ DEFAULTS: dict[str, Any] = {
     "frame_divisor": 0,
     "duration_s": 60.0,
     "poses": 20,
-    "sync_tolerance_us": 2000,
+    "sync_tolerance_us": 200,
     "max_sync_retries": 10,
     "capture_timeout_ms": 200,
     "writer_queue_pairs": 2,
     "startup_timeout_s": 15.0,
     "imu_topic": "/imu/data",
+    "imu_temperature_topic": "/imu/temperature",
     "imu_expected_rate_hz": 100.0,
     "imu_qos_depth": 2000,
+    "imu_preroll_s": 1.0,
+    "imu_postroll_s": 1.0,
     "clock_domain_max_offset_s": 5.0,
     "left_topic": "/stereo/left/image_raw",
     "right_topic": "/stereo/right/image_raw",
@@ -76,12 +85,19 @@ def parse_resolution(value: str) -> tuple[int, int]:
 
 
 def session_output_path(
-    output_root: str | Path = "./data", *, now: datetime | None = None
+    output_root: str | Path = "./data", *, dataset_name: str = "stereo",
+    now: datetime | None = None,
 ) -> str:
-    """Return <output_root>/YYYY-MM-DD_HH-MM-SS using local wall-clock time."""
+    """Return <output_root>/<dataset_name>_YYMMDD_hhmm in device local time."""
+    validate_dataset_name(dataset_name)
     root_text = str(output_root).strip() or "./data"
     timestamp = (now or datetime.now()).strftime(SESSION_DIRECTORY_FORMAT)
-    return str(Path(root_text).expanduser() / timestamp)
+    return str(Path(root_text).expanduser() / f"{dataset_name}_{timestamp}")
+
+
+def validate_dataset_name(value: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
+        raise ValueError("dataset_name must contain 1..64 ASCII letters, digits, '_' or '-', starting with a letter or digit")
 
 
 def detect_sdk_include_dir(explicit: str = "") -> str:
@@ -142,6 +158,8 @@ def load_ini_mapping(path: str | Path | None) -> dict[str, str]:
     unknown = sorted(set(values) - set(DEFAULTS))
     if unknown:
         raise ValueError("unknown configuration keys: " + ", ".join(unknown))
+    if values.get("schema_version") != APP_VERSION:
+        raise ValueError(f"INI schema_version must be {APP_VERSION}")
     for key, value in values.items():
         if "\n" in value:
             raise ValueError(f"INI value must be on one line: {key}")
@@ -152,6 +170,8 @@ def load_ini_mapping(path: str | Path | None) -> dict[str, str]:
 class CaptureConfig:
     mode: str
     output: str
+    schema_version: str
+    dataset_name: str
     ax_lib_dir: str
     sdk_include_dir: str
     left_pipe: int
@@ -174,8 +194,11 @@ class CaptureConfig:
     writer_queue_pairs: int
     startup_timeout_s: float
     imu_topic: str
+    imu_temperature_topic: str
     imu_expected_rate_hz: float
     imu_qos_depth: int
+    imu_preroll_s: float
+    imu_postroll_s: float
     clock_domain_max_offset_s: float
     left_topic: str
     right_topic: str
@@ -235,6 +258,12 @@ def build_capture_config(
         values["frame_divisor"] = 0
     values.update(override_values)
 
+    if values["schema_version"] != APP_VERSION:
+        raise ValueError(f"schema_version must be {APP_VERSION}")
+    if not values["dataset_name"]:
+        values["dataset_name"] = {"camera-imu": "stereo_imu", "imu-continuous": "imu"}.get(mode, "stereo")
+    validate_dataset_name(values["dataset_name"])
+
     width, height = parse_resolution(str(values.pop("resolution")))
     values["image_format"] = str(values["image_format"]).lower()
     if values["image_format"] not in {"bmp", "jpeg"}:
@@ -283,10 +312,16 @@ def build_capture_config(
         if not math.isfinite(numeric_value) or numeric_value <= 0:
             raise ValueError(f"{key} must be > 0")
         values[key] = numeric_value
+    for key in ("imu_preroll_s", "imu_postroll_s"):
+        numeric_value = float(values[key])
+        if not math.isfinite(numeric_value) or numeric_value < 0:
+            raise ValueError(f"{key} must be finite and >= 0")
+        values[key] = numeric_value
     for key in (
         "ax_lib_dir",
         "sdk_include_dir",
         "imu_topic",
+        "imu_temperature_topic",
         "left_topic",
         "right_topic",
         "left_frame_id",
@@ -304,6 +339,10 @@ def build_capture_config(
     }:
         raise ValueError("IMU and camera topics must be different")
 
+    if mode == "imu-continuous" and (
+        not values["imu_temperature_topic"] or values["imu_temperature_topic"] == values["imu_topic"]
+    ):
+        raise ValueError("IMU temperature topic must be nonempty and different from IMU topic")
     return CaptureConfig(
         mode=mode,
         output=output,

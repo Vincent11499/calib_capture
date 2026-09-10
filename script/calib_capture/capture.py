@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import signal
 import statistics
 import threading
 import time
@@ -16,7 +17,7 @@ from .axera import (
     assert_ctypes_abi,
 )
 from .bmp import BMP_PIXEL_OFFSET
-from .config import CaptureConfig, NS_PER_SECOND
+from .config import CaptureConfig, NS_PER_SECOND, DATASET_SCHEMA_VERSION
 from .dataset import DatasetWriter, ImuRecord, utc_now_text
 from .validator import ValidationReport, validate_dataset
 from .pipeline import PairDiskWriter
@@ -38,6 +39,32 @@ class CaptureFailed(RuntimeError):
 
 class UserAbort(RuntimeError):
     pass
+
+
+class _CaptureInterrupts:
+    """Turn SIGINT into requests so frame release cannot be interrupted."""
+
+    def __init__(self) -> None:
+        self.count = 0
+        self._previous: Any = None
+
+    def __enter__(self) -> _CaptureInterrupts:
+        if threading.current_thread() is threading.main_thread():
+            self._previous = signal.signal(signal.SIGINT, self._on_signal)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._previous is not None:
+            signal.signal(signal.SIGINT, self._previous)
+
+    def _on_signal(self, signum: int, frame: Any) -> None:
+        self.count += 1
+
+    def check(self, *, before_camera: bool = False) -> None:
+        if self.count >= 2:
+            raise UserAbort("second Ctrl+C: cancelled IMU padding; finishing safe cleanup")
+        if before_camera and self.count:
+            raise UserAbort("operator aborted before the camera recording window")
 
 
 def _estimated_stereo_gb(config: CaptureConfig, pair_count: float) -> float:
@@ -111,10 +138,12 @@ class ImuSubscriber:
     def __init__(
         self,
         config: CaptureConfig,
-        callback: Callable[[ImuRecord], None] | None = None,
+        callback: Callable[[ImuRecord], bool | None] | None = None,
+        *, temperature_callback: Callable[[Any], None] | None = None,
     ) -> None:
         self.config = config
         self.callback = callback
+        self.temperature_callback = temperature_callback
         self.records: list[ImuRecord] = []
         self.count = 0
         self.first_timestamp_ns: int | None = None
@@ -130,6 +159,7 @@ class ImuSubscriber:
         try:
             import rclpy
             from rclpy.node import Node
+            from rclpy.signals import SignalHandlerOptions
             from rclpy.qos import (
                 DurabilityPolicy,
                 HistoryPolicy,
@@ -156,6 +186,19 @@ class ImuSubscriber:
                 self.subscription = self.create_subscription(
                     Imu, owner.config.imu_topic, self.on_imu, qos
                 )
+                if owner.temperature_callback is not None:
+                    from sensor_msgs.msg import Temperature
+                    self.temperature_subscription = self.create_subscription(
+                        Temperature, owner.config.imu_temperature_topic, self.on_temperature, qos
+                    )
+
+            def on_temperature(self, message: Any) -> None:
+                try:
+                    owner.temperature_callback(message)
+                except BaseException as exc:
+                    owner.error = exc
+                    owner.stop_event.set()
+                    owner.first_event.set()
 
             def on_imu(self, message: Any) -> None:
                 try:
@@ -164,7 +207,7 @@ class ImuSubscriber:
                     )
                     record = ImuRecord(
                         timestamp_ns=timestamp_ns,
-                        frame_id=str(message.header.frame_id or owner.config.imu_frame_id),
+                        frame_id=str(message.header.frame_id),
                         orientation=(
                             float(message.orientation.x),
                             float(message.orientation.y),
@@ -197,7 +240,8 @@ class ImuSubscriber:
                     if owner.last_timestamp_ns is not None and record.timestamp_ns <= owner.last_timestamp_ns:
                         raise ValueError("IMU header timestamp is not strictly increasing")
                     if owner.callback is not None:
-                        owner.callback(record)
+                        if owner.callback(record) is False:
+                            return  # IMU-only warmup: no temperature received yet.
                     else:
                         owner.records.append(record)
                     owner.count += 1
@@ -212,7 +256,9 @@ class ImuSubscriber:
 
         self._rclpy = rclpy
         # Do not let rclpy parse this tool's non-ROS command-line arguments.
-        rclpy.init(args=[])
+        # The capture loop owns Ctrl+C: rclpy must not shut the subscriber down
+        # before the final camera frame has its requested IMU post-roll.
+        rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
         self._node = CaptureImuNode()
         self._thread = threading.Thread(target=self._spin, name="calibration-imu-subscriber")
         self._thread.start()
@@ -225,15 +271,25 @@ class ImuSubscriber:
         try:
             while not self.stop_event.is_set() and self._rclpy.ok():
                 self._rclpy.spin_once(self._node, timeout_sec=0.1)
+            if not self.stop_event.is_set():
+                raise RuntimeError("ROS 2 context stopped during IMU recording")
         except BaseException as exc:
             self.error = exc
             self.first_event.set()
 
-    def wait_first(self, timeout_s: float) -> int:
-        if not self.first_event.wait(timeout_s):
-            raise RuntimeError(
-                f"startup timeout: no IMU data from {self.config.imu_topic} in {timeout_s:g} s"
-            )
+    def wait_first(self, timeout_s: float, check: Callable[[], None] | None = None) -> int:
+        deadline = time.monotonic() + timeout_s
+        while not self.first_event.is_set():
+            if check is not None:
+                check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"startup timeout: no ready IMU data from {self.config.imu_topic} in {timeout_s:g} s"
+                    + (f" (also waiting for {self.config.imu_temperature_topic})"
+                       if self.temperature_callback is not None else "")
+                )
+            self.first_event.wait(min(0.05, remaining))
         self.raise_if_failed()
         if self.first_timestamp_ns is None:
             raise RuntimeError("IMU subscriber stopped before receiving a sample")
@@ -288,15 +344,98 @@ def _warmup_pair(grabber: StereoGrabber, *, bottom_up: bool = False) -> tuple[di
             grabber.release_frames(frames)
 
 
+def _check_startup_clock(
+    camera_timestamp_ns: int, imu: ImuSubscriber, config: CaptureConfig,
+    stats: dict[str, Any],
+) -> None:
+    """Compare contemporaneous samples before deliberate IMU padding."""
+    imu.raise_if_failed()
+    imu_timestamp_ns = imu.last_timestamp_ns
+    if imu_timestamp_ns is None:
+        raise RuntimeError("IMU subscriber has no startup timestamp")
+    offset_ns = abs(camera_timestamp_ns - imu_timestamp_ns)
+    stats.update(
+        startup_camera_timestamp_ns=camera_timestamp_ns,
+        startup_imu_timestamp_ns=imu_timestamp_ns,
+        startup_camera_imu_offset_ns=offset_ns,
+    )
+    if offset_ns > round(config.clock_domain_max_offset_s * NS_PER_SECOND):
+        raise RuntimeError(
+            f"camera/IMU timestamps are in different clock domains: offset={offset_ns / 1e9:.6f} s"
+        )
+
+
+def _wait_imu_preroll(
+    grabber: StereoGrabber, imu: ImuSubscriber, config: CaptureConfig,
+    previous_left_ns: int, previous_right_ns: int,
+    check: Callable[[], None],
+) -> tuple[int, int]:
+    """Drain camera metadata without mapping until both sensors cover pre-roll."""
+    check()
+    imu.raise_if_failed()
+    if config.imu_preroll_s == 0:
+        return previous_left_ns, previous_right_ns
+    if imu.first_timestamp_ns is None:
+        raise RuntimeError("IMU pre-roll started without an IMU sample")
+    target_ns = imu.first_timestamp_ns + round(config.imu_preroll_s * NS_PER_SECOND)
+    deadline = time.monotonic() + config.imu_preroll_s + config.startup_timeout_s
+    while True:
+        check()
+        imu.raise_if_failed()
+        if time.monotonic() >= deadline:
+            raise RuntimeError("IMU pre-roll timeout: camera/IMU sensor-time coverage did not advance")
+        frames = grabber.grab_frames()
+        try:
+            left_ns = int(frames.left.u64PTS) * 1000
+            right_ns = int(frames.right.u64PTS) * 1000
+            if left_ns <= previous_left_ns or right_ns <= previous_right_ns:
+                raise RuntimeError("camera source PTS is not strictly increasing during IMU pre-roll")
+            previous_left_ns, previous_right_ns = left_ns, right_ns
+            check()
+            imu.raise_if_failed()
+            if min(left_ns, right_ns) >= target_ns and (
+                imu.last_timestamp_ns is not None and imu.last_timestamp_ns >= target_ns
+            ):
+                return left_ns, right_ns
+        finally:
+            if not frames.released:
+                grabber.release_frames(frames)
+
+
+def _wait_imu_postroll(
+    imu: ImuSubscriber, last_camera_timestamp_ns: int, config: CaptureConfig,
+    check: Callable[[], None], *, deadline: float,
+) -> None:
+    check()
+    imu.raise_if_failed()
+    if config.imu_postroll_s == 0:
+        return
+    target_ns = last_camera_timestamp_ns + round(config.imu_postroll_s * NS_PER_SECOND)
+    while True:
+        check()
+        imu.raise_if_failed()
+        if imu.last_timestamp_ns is not None and imu.last_timestamp_ns >= target_ns:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("IMU post-roll timeout: the final camera timestamp is not fully covered")
+        time.sleep(min(0.05, remaining))
+
+
 def _finish_dataset(
     dataset: DatasetWriter,
     session: dict[str, Any],
     *,
     requested_success: bool,
+    check: Callable[[], None] | None = None,
 ) -> tuple[Path, ValidationReport]:
     session_data = dataset.seal_payload(session)
+    if check is not None:
+        check()
     validation_start = time.perf_counter()
     report = validate_dataset(dataset.staging_path, write_report=True)
+    if check is not None:
+        check()
     session_data["validation_duration_s"] = time.perf_counter() - validation_start
     session_data["peak_rss_bytes"] = peak_rss_bytes()
     session_data["capture_status"] = (
@@ -308,6 +447,8 @@ def _finish_dataset(
     session_data["validation_stats"] = report.stats
     dataset.write_session(session_data)
     success = requested_success and not report.errors
+    if check is not None:
+        check()
     return dataset.commit(success), report
 
 
@@ -342,11 +483,21 @@ def _capture_session(
         session["ax_return_errors"] = list(api.ax_errors)
     if grabber is not None:
         session["grabber_stats"] = grabber.stats
+        session["acquisition_lifetime_stats"] = grabber.acquisition_stats.summary()
+        if grabber.sequence_window is not None:
+            stats.update(grabber.sequence_window.summary())
         session["capture_stages"] = grabber.timings.summary()
     return session
 
 
 def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path, ValidationReport]:
+    with _CaptureInterrupts() as interrupts:
+        return _record_continuous(config, include_imu=include_imu, interrupts=interrupts)
+
+
+def _record_continuous(
+    config: CaptureConfig, *, include_imu: bool, interrupts: _CaptureInterrupts,
+) -> tuple[Path, ValidationReport]:
     if not config.output:
         raise ValueError("--output is required")
     estimated_pairs = config.duration_s * config.target_save_rate_hz
@@ -380,6 +531,8 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
         "writer_saved_pairs": 0,
         "operator_interrupted": False,
         "capture_status": "completed",
+        "imu_preroll_wall_s": 0.0,
+        "imu_postroll_wait_wall_s": 0.0,
     }
     deinit_result: int | None = None
     try:
@@ -388,18 +541,28 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
         if include_imu:
             imu = ImuSubscriber(config, dataset.write_imu)
             imu.start()
-            first_imu_timestamp = imu.wait_first(config.startup_timeout_s)
-        else:
-            first_imu_timestamp = None
+            imu.wait_first(config.startup_timeout_s, lambda: interrupts.check(before_camera=True))
 
+        interrupts.check(before_camera=True)
         warmup, warmup_timestamp = _warmup_pair(grabber, bottom_up=config.image_format == "bmp")
-        if first_imu_timestamp is not None:
-            offset_ns = abs(warmup_timestamp - first_imu_timestamp)
-            stats["startup_camera_imu_offset_ns"] = offset_ns
-            if offset_ns > round(config.clock_domain_max_offset_s * NS_PER_SECOND):
-                raise RuntimeError(
-                    f"camera/IMU timestamps are in different clock domains: offset={offset_ns / 1e9:.6f} s"
+        previous_left_ns = int(warmup["left"]["timestamp_us"]) * 1000
+        previous_right_ns = int(warmup["right"]["timestamp_us"]) * 1000
+        interrupts.check(before_camera=True)
+        if imu is not None:
+            _check_startup_clock(warmup_timestamp, imu, config, stats)
+            preroll_started = time.monotonic()
+
+            def check_preroll() -> None:
+                interrupts.check(before_camera=True)
+                dataset.raise_if_failed()
+
+            try:
+                previous_left_ns, previous_right_ns = _wait_imu_preroll(
+                    grabber, imu, config, previous_left_ns, previous_right_ns,
+                    check_preroll,
                 )
+            finally:
+                stats["imu_preroll_wall_s"] = time.monotonic() - preroll_started
 
         pair_writer = PairDiskWriter(dataset, config.writer_queue_pairs)
         divider = FrameDivider(config.frame_divisor) if config.frame_divisor > 0 else None
@@ -407,19 +570,21 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
         capture_started = time.monotonic()
         capture_cpu_started = time.process_time()
         deadline = capture_started + config.duration_s
-        previous_left_ns = int(warmup["left"]["timestamp_us"]) * 1000
-        previous_right_ns = int(warmup["right"]["timestamp_us"]) * 1000
-        # The warmup performs one full-resolution gray copy. Do not count the
-        # source frames produced during that startup check as recording gaps.
-        previous_left_sequence: int | None = None
-        previous_right_sequence: int | None = None
+        # Exclude warmup, preroll and the transition into the image window.
+        grabber.start_sequence_window()
         try:
             while time.monotonic() < deadline:
+                interrupts.check()
+                if interrupts.count:
+                    break
                 if imu is not None:
                     imu.raise_if_failed()
                 pair_writer.raise_if_failed()
                 frames = grabber.grab_frames()
                 try:
+                    interrupts.check()
+                    if interrupts.count:
+                        break
                     left_ns = int(frames.left.u64PTS) * 1000
                     right_ns = int(frames.right.u64PTS) * 1000
                     if left_ns <= previous_left_ns or right_ns <= previous_right_ns:
@@ -427,22 +592,6 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
                     previous_left_ns, previous_right_ns = left_ns, right_ns
                     left_sequence = int(frames.left.u64SeqNum)
                     right_sequence = int(frames.right.u64SeqNum)
-                    if previous_left_sequence is not None:
-                        if left_sequence > previous_left_sequence + 1:
-                            stats["source_left_sequence_gaps"] += (
-                                left_sequence - previous_left_sequence - 1
-                            )
-                        elif left_sequence <= previous_left_sequence:
-                            stats["source_sequence_regressions"] += 1
-                    if previous_right_sequence is not None:
-                        if right_sequence > previous_right_sequence + 1:
-                            stats["source_right_sequence_gaps"] += (
-                                right_sequence - previous_right_sequence - 1
-                            )
-                        elif right_sequence <= previous_right_sequence:
-                            stats["source_sequence_regressions"] += 1
-                    previous_left_sequence = left_sequence
-                    previous_right_sequence = right_sequence
                     stats["source_pairs"] += 1
                     pair_timestamp_ns = (left_ns + right_ns) // 2
                     stats.setdefault("source_first_timestamp_ns", pair_timestamp_ns)
@@ -474,19 +623,45 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
                     if not frames.released:
                         grabber.release_frames(frames)
         except KeyboardInterrupt:
-            stats["operator_interrupted"] = True
-            stats["capture_status"] = "operator_stopped"
+            # Also support embedded callers that raise KeyboardInterrupt rather
+            # than using the main-thread SIGINT request handler.
+            interrupts.count += 1
+            interrupts.check()
 
-        if imu is not None:
-            imu.stop()
-            imu = None
         stats["capture_wall_s"] = time.monotonic() - capture_started
-        pair_writer.finish()
+        postroll_deadline = time.monotonic() + config.imu_postroll_s + config.startup_timeout_s
+
+        def check_finishing() -> None:
+            interrupts.check()
+            if imu is not None:
+                imu.raise_if_failed()
+            dataset.raise_if_failed()
+
+        # The IMU callback remains active while images drain. Its timestamps
+        # often already satisfy post-roll by the time the final pair commits.
+        pair_writer.finish(check_finishing)
         stats["capture_and_drain_cpu_s"] = time.process_time() - capture_cpu_started
         stats["capture_and_drain_wall_s"] = time.monotonic() - capture_started
         stats["pipeline"] = pair_writer.summary()
         stats["capture_peak_rss_bytes"] = peak_rss_bytes()
         pair_writer = None
+        if imu is not None:
+            last_camera_ns = dataset.last_camera_timestamp_ns
+            if last_camera_ns is None:
+                raise RuntimeError("camera-IMU recording stopped without a saved camera pair")
+            postroll_started = time.monotonic()
+            try:
+                _wait_imu_postroll(
+                    imu, last_camera_ns, config, check_finishing, deadline=postroll_deadline,
+                )
+            finally:
+                stats["imu_postroll_wait_wall_s"] = time.monotonic() - postroll_started
+            imu.stop()
+            imu = None
+        interrupts.check()
+        if interrupts.count:
+            stats["operator_interrupted"] = True
+            stats["capture_status"] = "operator_stopped"
         stats["writer_saved_pairs"] = dataset.pair_count
         stats["imu_saved_samples"] = dataset.imu_count
         if stats["source_pairs"] > 1:
@@ -500,9 +675,10 @@ def record_continuous(config: CaptureConfig, *, include_imu: bool) -> tuple[Path
                 )
         deinit_result = api.close()
         session = _capture_session(config, api, grabber, warmup, stats, deinit_result)
-        return _finish_dataset(dataset, session, requested_success=True)
+        return _finish_dataset(dataset, session, requested_success=True, check=interrupts.check)
     except BaseException as exc:
         cleanup_errors: list[str] = []
+        stats["operator_interrupted"] = bool(interrupts.count) or isinstance(exc, KeyboardInterrupt)
         if imu is not None:
             try:
                 imu.stop()
@@ -654,6 +830,7 @@ def probe_hardware(
         finally:
             if not frames.released:
                 grabber.release_frames(frames)
+        grabber.start_sequence_window()
         for _ in range(samples):
             frames = grabber.grab_frames()
             try:
@@ -702,16 +879,10 @@ def probe_hardware(
     warnings: list[str] = []
     errors: list[str] = []
     sequence_summary: dict[str, dict[str, int]] = {}
+    acquisition = grabber.sequence_window.summary()
     for side in ("left", "right"):
-        sequences = [int(item[side]["sequence"]) for item in descriptions]
-        gaps = sum(
-            max(0, current - previous - 1)
-            for previous, current in zip(sequences, sequences[1:])
-        )
-        regressions = sum(
-            current <= previous
-            for previous, current in zip(sequences, sequences[1:])
-        )
+        gaps = acquisition[f"source_{side}_sequence_gaps"]
+        regressions = acquisition[f"source_{side}_sequence_regressions"]
         sequence_summary[side] = {"gaps": gaps, "regressions": regressions}
         if gaps:
             warnings.append(f"{side} camera source sequence gaps observed: {gaps}")
@@ -770,6 +941,8 @@ def probe_hardware(
                 errors.append("camera and IMU timestamps do not overlap during probe")
 
     result = {
+        "schema_version": DATASET_SCHEMA_VERSION,
+        "kind": "capture_probe",
         "status": "fail" if errors else ("warning" if warnings else "pass"),
         "errors": errors,
         "warnings": warnings,
@@ -797,6 +970,7 @@ def probe_hardware(
         },
         "source_rate_hz": {"left": left_rate, "right": right_rate},
         "source_sequence": sequence_summary,
+        "acquisition_window_stats": acquisition,
         "stereo_delta_us": {
             "minimum": min(deltas),
             "maximum": max(deltas),

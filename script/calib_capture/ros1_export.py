@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .image_io import read_mono8_image
+from .config import DATASET_SCHEMA_VERSION
 from .validator import validate_dataset
 
 
@@ -259,13 +260,15 @@ def export_ros1_bag(
         )
 
     dataset = Path(dataset_root).expanduser().resolve()
+    session = _load_session(dataset)
+    if session.get("schema_version") != DATASET_SCHEMA_VERSION:
+        raise RuntimeError("dataset validation failed: schema_version must be 1.0.0; legacy export is unsupported")
     validation = validate_dataset(dataset, write_report=True)
     if validation.errors and not force_dataset:
         raise RuntimeError(
             "dataset validation failed; fix it or pass --force-dataset: "
             + "; ".join(validation.errors)
         )
-    session = _load_session(dataset)
     config = session.get("config", {})
     include_imu = str(config.get("mode", session.get("mode", ""))) == "camera-imu"
     topics = {
@@ -279,7 +282,7 @@ def export_ros1_bag(
     frame_ids = {
         "cam0": str(config.get("left_frame_id", "cam0")),
         "cam1": str(config.get("right_frame_id", "cam1")),
-        "imu": str(config.get("imu_frame_id", "imu0")),
+        "imu": str(session.get("imu_frame_id", config.get("imu_frame_id", "imu0"))),
     }
 
     target = Path(destination).expanduser().resolve()
@@ -335,6 +338,8 @@ def export_ros1_bag(
         )
         temporary.replace(target)
         return {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "kind": "ros1_export_result",
             "status": "pass",
             "dataset": str(dataset),
             "bag": str(target),

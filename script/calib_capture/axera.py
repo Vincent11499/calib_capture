@@ -669,6 +669,42 @@ class StereoFrames:
     released: bool = False
 
 
+class AcquisitionStats:
+    """Constant-space counters over successful SDK gets, before synchronization."""
+
+    def __init__(self) -> None:
+        self.previous: dict[str, int] = {}
+        self.counts = {
+            f"source_{side}_{metric}": 0
+            for side in ("left", "right")
+            for metric in ("acquired_frames", "sequence_gaps", "sequence_regressions")
+        }
+        self.counts.update({f"sync_{side}_discarded_frames": 0 for side in ("left", "right")})
+
+    def acquired(self, side: str, sequence: int) -> None:
+        previous = self.previous.get(side)
+        self.counts[f"source_{side}_acquired_frames"] += 1
+        if previous is not None:
+            self.counts[f"source_{side}_sequence_gaps"] += max(0, sequence - previous - 1)
+            self.counts[f"source_{side}_sequence_regressions"] += int(sequence <= previous)
+        self.previous[side] = sequence
+
+    def discarded(self, side: str) -> None:
+        self.counts[f"sync_{side}_discarded_frames"] += 1
+
+    def summary(self) -> dict[str, int | str]:
+        return {
+            **self.counts,
+            "source_sequence_accounting": "successful_vin_get_v1",
+            "source_sequence_regressions": sum(
+                self.counts[f"source_{side}_sequence_regressions"] for side in ("left", "right")
+            ),
+            "sync_discarded_frames": sum(
+                self.counts[f"sync_{side}_discarded_frames"] for side in ("left", "right")
+            ),
+        }
+
+
 class StereoGrabber:
     def __init__(
         self,
@@ -695,6 +731,8 @@ class StereoGrabber:
         self.expected_resolution = expected_resolution
         self.expected_format = expected_format
         self.timings = Timings()
+        self.acquisition_stats = AcquisitionStats()
+        self.sequence_window: AcquisitionStats | None = None
         self.stats: dict[str, int] = {
             "get_left_calls": 0,
             "get_right_calls": 0,
@@ -704,6 +742,15 @@ class StereoGrabber:
             "sync_retries": 0,
             "sync_failures": 0,
         }
+
+    def start_sequence_window(self) -> None:
+        # The first successful get on each side establishes a fresh baseline.
+        self.sequence_window = AcquisitionStats()
+
+    def _sync_discard(self, side: str) -> None:
+        self.acquisition_stats.discarded(side)
+        if self.sequence_window is not None:
+            self.sequence_window.discarded(side)
 
     def _get(self, side: str) -> AxVideoFrame:
         frame = AxVideoFrame()
@@ -716,6 +763,9 @@ class StereoGrabber:
         if result != 0:
             self.stats[f"get_{side}_errors"] += 1
             raise RuntimeError(f"AX_VIN_GetYuvFrame({side}) failed: {ax_return_code_text(result)}")
+        self.acquisition_stats.acquired(side, int(frame.u64SeqNum))
+        if self.sequence_window is not None:
+            self.sequence_window.acquired(side, int(frame.u64SeqNum))
         return frame
 
     def _release_one(self, side: str, frame: AxVideoFrame) -> None:
@@ -755,11 +805,13 @@ class StereoGrabber:
                 retries += 1
                 self.stats["sync_retries"] += 1
                 if int(left.u64PTS) < int(right.u64PTS):
+                    self._sync_discard("left")
                     old_left = left
                     left = None
                     self._release_one("left", old_left)
                     left = self._get("left")
                 else:
+                    self._sync_discard("right")
                     old_right = right
                     right = None
                     self._release_one("right", old_right)

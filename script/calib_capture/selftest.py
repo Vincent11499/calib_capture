@@ -25,7 +25,7 @@ from .axera import (
 )
 from .bmp import read_mono8_bmp, write_mono8_bmp
 from .capture import FrameDivider, RateLimiter
-from .config import build_capture_config
+from .config import build_capture_config, DATASET_SCHEMA_VERSION
 from .dataset import DatasetWriter, ImuRecord
 from .validator import validate_dataset
 
@@ -118,7 +118,8 @@ def run_self_test(sdk_include_dir: str = "") -> dict[str, Any]:
         config = build_capture_config(
             mode="camera-imu",
             output=str(output),
-            overrides={"resolution": "1920x1080", "save_rate_hz": 10.0},
+            overrides={"resolution": "1920x1080", "save_rate_hz": 10.0,
+                       "imu_preroll_s": 0, "imu_postroll_s": 0},
         )
         # Use a compact test frame while retaining the same data contract.
         object.__setattr__(config, "width", 5)
@@ -158,7 +159,11 @@ def run_self_test(sdk_include_dir: str = "") -> dict[str, Any]:
             {
                 "mode": "camera-imu",
                 "capture_status": "completed",
-                "capture_stats": {},
+                "capture_stats": {
+                    "startup_camera_timestamp_ns": 1_000_000_000,
+                    "startup_imu_timestamp_ns": 1_000_000_000,
+                    "startup_camera_imu_offset_ns": 0,
+                },
                 "sdk_header_contract": header_contract,
             }
         )
@@ -187,6 +192,8 @@ def run_self_test(sdk_include_dir: str = "") -> dict[str, Any]:
         tests.append("no_hardware_unittest_suite")
 
     return {
+        "schema_version": DATASET_SCHEMA_VERSION,
+        "kind": "capture_self_test",
         "status": "pass",
         "tests": tests,
         "ctypes": {

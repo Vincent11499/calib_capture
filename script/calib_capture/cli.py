@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from .capture import (
@@ -34,9 +35,10 @@ def _add_capture_options(
             metavar="DIR",
             help=(
                 "session root directory (default: ./data); the dataset is created "
-                "as DIR/YYYY-MM-DD_HH-MM-SS"
+                "as DIR/<dataset_name>_YYMMDD_hhmm; existing names are rejected"
             ),
         )
+        parser.add_argument("--dataset-name", default=None, help="session prefix (default: stereo or stereo_imu)")
     parser.add_argument("--ax-lib-dir", default=None)
     parser.add_argument("--sdk-include-dir", default=None)
     parser.add_argument("--left-pipe", type=int, default=None)
@@ -115,6 +117,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     camera_imu = subparsers.add_parser("camera-imu", help="continuous stereo plus IMU capture")
     _add_capture_options(camera_imu, output=True, continuous=True)
+    camera_imu.add_argument("--imu-preroll-s", type=float, default=None,
+                            help="IMU coverage before images in seconds (default 1; 0 disables)")
+    camera_imu.add_argument("--imu-postroll-s", type=float, default=None,
+                            help="IMU coverage after images in seconds (default 1; 0 disables)")
+
+    imu_only = subparsers.add_parser("imu-continuous", help="IMU-only CSV capture for Allan analysis; no camera")
+    imu_only.add_argument("--output", default="./data", metavar="DIR")
+    imu_only.add_argument("--dataset-name", default=None, help="session prefix (default: imu)")
+    imu_only.add_argument("--duration-s", type=float, default=None, help="recording seconds after first sample (default 60)")
+    imu_only.add_argument("--imu-topic", default=None)
+    imu_only.add_argument("--imu-temperature-topic", default=None, help="sensor_msgs/Temperature topic (default /imu/temperature)")
+    imu_only.add_argument("--imu-frame-id", default=None)
+    imu_only.add_argument("--imu-expected-rate-hz", type=float, default=None, help="diagnostics only; never limits samples")
+    imu_only.add_argument("--imu-qos-depth", type=int, default=None)
+    imu_only.add_argument("--startup-timeout-s", type=float, default=None, help="first-message and stream-stall timeout")
 
     validate = subparsers.add_parser("validate", help="validate a directory dataset")
     validate.add_argument("dataset")
@@ -136,21 +153,23 @@ def build_parser() -> argparse.ArgumentParser:
 def _capture_config(args: argparse.Namespace, mode: str) -> CaptureConfig:
     values = vars(args)
     overrides = {key: values.get(key) for key in DEFAULTS if values.get(key) is not None}
-    output = ""
-    if mode in {"stereo-triggered", "stereo-continuous", "camera-imu"}:
-        output = session_output_path(str(values.get("output") or "./data"))
-    return build_capture_config(
+    config = build_capture_config(
         mode=mode,
-        output=output,
         config_path=args.config,
         overrides=overrides,
     )
+    if mode in {"stereo-triggered", "stereo-continuous", "camera-imu", "imu-continuous"}:
+        config = replace(config, output=session_output_path(
+            str(values.get("output") or "./data"), dataset_name=config.dataset_name))
+    return config
 
 
 def _print_capture_result(path: Path, report: ValidationReport) -> None:
     print(
         json.dumps(
             {
+                "schema_version": APP_VERSION,
+                "kind": "capture_result",
                 "dataset": str(path),
                 "validation": report.to_dict(),
             },
@@ -187,13 +206,18 @@ def main(argv: list[str] | None = None) -> int:
             _print_capture_result(path, report)
             return 0 if not report.errors else 1
         if args.command == "validate":
-            report = validate_dataset(
+            from .imu_only import is_imu_only, validate_imu_only
+            validator = validate_imu_only if is_imu_only(args.dataset) else validate_dataset
+            report = validator(
                 args.dataset,
                 write_report=True,
             )
             print(json.dumps(report.to_dict(), indent=2, sort_keys=True, ensure_ascii=False))
             return 0 if not report.errors else 1
         if args.command == "export-ros1":
+            from .imu_only import is_imu_only
+            if is_imu_only(args.dataset):
+                raise ValueError("IMU-only Allan CSV does not support ROS1 bag export; use imu/imu0.csv")
             result = export_ros1_bag(
                 args.dataset,
                 args.bag,
@@ -205,6 +229,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False))
             return 0
+        if args.command == "imu-continuous":
+            from .imu_only import record_imu_only
+            path, report = record_imu_only(_capture_config(args, "imu-continuous"))
+            _print_capture_result(path, report)
+            return 0 if not report.errors else 1
         if args.command == "self-test":
             include_dir = detect_sdk_include_dir(args.sdk_include_dir or "")
             result = run_self_test(include_dir)

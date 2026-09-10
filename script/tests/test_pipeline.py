@@ -81,7 +81,7 @@ class PipelineTests(unittest.TestCase):
     def test_workers_ini_cli_and_range(self):
         self.assertEqual(build_capture_config(mode="camera-imu").image_workers,2)
         with tempfile.TemporaryDirectory() as root:
-            path=Path(root)/"config.ini";path.write_text("[capture]\nimage_workers=4\n")
+            path=Path(root)/"config.ini";path.write_text("[capture]\nschema_version = 1.0.0\nimage_workers=4\n")
             args=build_parser().parse_args(["--config",str(path),"camera-imu","--image-workers","6"])
             self.assertEqual(_capture_config(args,args.command).image_workers,6)
         for workers in (0,9):

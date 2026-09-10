@@ -15,14 +15,14 @@ from calib_capture.dataset import DatasetWriter
 from calib_capture.image_io import read_mono8_image, write_mono8_image
 from calib_capture.ros1_export import ExportEvent, _make_image, export_ros1_bag
 from calib_capture.validator import validate_dataset
-from test_calibration_data import create_dataset, make_pair
+from test_calibration_data import create_dataset, make_legacy_fixture, make_pair, rosbag_export_skip_reason
 
 
 class ImageConfigTests(unittest.TestCase):
     def test_jpeg_cli_and_ini_priority(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "capture.ini"
-            path.write_text("[capture]\nimage_format = jpeg\njpeg_quality = 90\n", encoding="utf-8")
+            path.write_text("[capture]\nschema_version = 1.0.0\nimage_format = jpeg\njpeg_quality = 90\n", encoding="utf-8")
             args = build_parser().parse_args([
                 "--config", str(path), "camera-imu", "--jpeg-quality", "95"])
             config = _capture_config(args, args.command)
@@ -44,9 +44,10 @@ class ImageConfigTests(unittest.TestCase):
                     DatasetWriter(path, config, True)
             self.assertEqual(list(Path(raw).iterdir()), [])
 
-    def test_schema_two_bmp_without_new_config_keys_remains_readable(self):
+    def test_schema_two_bmp_without_new_config_keys_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
             path = create_dataset(Path(raw))
+            make_legacy_fixture(path, 2)
             session_path = path / "meta/session.json"
             session = json.loads(session_path.read_text())
             session["schema_version"] = 2
@@ -57,7 +58,7 @@ class ImageConfigTests(unittest.TestCase):
             text = yaml.read_text().replace("schema_version: 3", "schema_version: 2")
             yaml.write_text("\n".join(line for line in text.splitlines()
                                       if not line.startswith(("image_format:", "jpeg_quality:", "lossy:"))) + "\n")
-            self.assertFalse(validate_dataset(path).errors)
+            self.assertTrue(validate_dataset(path).errors)
 
     def test_jpeg_workers_overlap_before_pair_commit(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -149,7 +150,7 @@ class JpegTests(unittest.TestCase):
             self.assertFalse(list(writer.staging_path.rglob("*.tmp")))
             writer.abandon(RuntimeError("test cleanup"))
 
-    @unittest.skipUnless(importlib.util.find_spec("rosbags"), "rosbags is not installed")
+    @unittest.skipIf(rosbag_export_skip_reason(), rosbag_export_skip_reason())
     def test_jpeg_ros1_export_and_reopen(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

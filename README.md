@@ -1,31 +1,34 @@
-# calib_capture
+# calib_capture v1.0.0
 
-双目及双目–IMU 标定数据采集工具。板端使用 Python 调用 AXERA VIN 获取双目图像，通过 ROS 2 订阅 IMU；先保存目录数据集，再在 PC 本机使用 `rosbags` 导出 ROS1 bag。
+双目及双目–IMU 标定采集工具。板端通过 AXERA VIN 获取图像，通过 ROS 2 订阅 IMU；新目录数据集直接交给 Kalibr no-ROS v1.0.0。入口为 `script/calibration_data.py`。
 
-默认左目为 VIN pipe 2 / chn 0，右目为 VIN pipe 0 / chn 0，输入格式 NV12。支持校验上游输出的 3840×2160 或 1920×1080 分辨率，保存无损灰度 BMP。
+软件、CLI、INI 配置和项目结构化输出统一版本 `1.0.0`。本版只接收新契约，不兼容或迁移历史数据；已有采集文件保留原样，仍可由原版本工具读取。
 
-连续采集默认保存双目 5 Hz（约 200 ms 一对），IMU 收到的消息全部保存。默认持续 60 秒，4K 双目图像约 5 GB。
+默认 cam0 为左目 VIN pipe 2/chn 0，cam1 为右目 pipe 0/chn 0。正式标定只读取 cali VIN NV12，不重配管线、不缩放；保存原尺寸无损灰度 BMP，可显式选择 JPEG95。支持上游 3840×2160 或 1920×1080 输出。
 
-`image_workers`／`--image-workers` 默认 2（1–8），BMP/JPEG 共用有界图像线程池，按双目对顺序提交。Y 平面直接复制到复用缓冲；CSV/IMU JSONL 每 0.5 秒批量刷新，正常退出最终刷新。默认 5 Hz 不变，20 Hz 仅作为显式性能探索目标。
+`--output` 为输出根目录，默认 `./data`。新会话命名为 `<dataset_name>_YYMMDD_hhmm`，日期来自设备本地时间；同名前缀在一分钟内重复录制会报错。前缀可用 `--dataset-name` 或 INI `dataset_name` 设置，默认双目 `stereo`、双目–IMU `stereo_imu`、独立 IMU `imu`。
 
-配置可通过 `--config script/default_config.ini` 指定，使用 Python 标准库 `configparser`，无需 PyYAML；不指定时使用内置默认值和命令行参数，不自动读取模板。`--config` 须放在子命令前。
+```bash
+python3 script/calibration_data.py --version
+python3 script/calibration_data.py --config script/default_config.ini camera-imu \
+  --output ./data --dataset-name evt31 --resolution 1920x1080
+```
 
-图像按大块写入，不计算数据文件 SHA-256。校验保留 BMP 格式/大小、配对、CSV 与时间戳一致性检查；不能检测文件长度未变的像素位错误。
+默认双目保存 5 Hz、图像窗口 60 秒、IMU 全部保存；Camera–IMU 默认在图像前后各保留至少 1 秒 IMU。连续采集按完整双目对限频和入队，默认两个图像写盘线程；左右 PTS 差最多 200 µs。
 
-需要减小体积时，在 INI `[capture]` 中设置 `image_format = jpeg`、`jpeg_quality = 95`，或传 `--image-format jpeg --jpeg-quality 95`。JPEG 直接使用现有 OpenCV/NumPy 编解码，不使用 Pillow；保存有损灰度 JPG，不缩放，质量范围 1–100。旧 BMP 数据仍可读取，bag 导出使用解码后的 mono8。
-
-## 文档
+采集 INI 使用 Python 标准库，无需 PyYAML，注释单独起行。优先级为 CLI > 显式 INI > 内置默认；不指定 `--config` 时不自动加载模板。INI 必须包含 `[capture]` 和 `schema_version = 1.0.0`。
 
 - [快速开始](doc/README.md)
-- [使用操作说明](doc/使用操作说明.md)
-- [数据集格式](doc/DATASET_FORMAT.md)
+- [操作说明](doc/使用操作说明.md)
+- [数据集格式与字段](doc/DATASET_FORMAT.md)
 - [AXERA 接口与 ABI](doc/AXERA_IVPS.md)
-- [项目维护规范](AGENTS.md)
+- [维护规范](AGENTS.md)
 
-入口为 `script/calibration_data.py`，提供 `probe`、`stereo-triggered`、`stereo-continuous`、`camera-imu`、`validate`、`export-ros1` 和 `self-test` 子命令。
+无硬件验证从 `script` 执行：
 
-## 文件管理
+```bash
+python3 calibration_data.py self-test
+python3 -m unittest discover -s tests -v
+```
 
-Git 跟踪 `script/`、`doc/` 和顶层项目说明。`data/`、`tmp/`、生成的 bag/BMP、Python 环境及缓存等由 `.gitignore` 排除。采集默认输出到 `./data/YYYY-MM-DD_HH-MM-SS/`。
-
-板端部署仅同步 `script/`。ROS1 bag 转换及其 `rosbags` 依赖在 PC 本机使用。
+部署需要另行授权，只同步 `script/`；不在本次升级中执行 SSH、SCP 或板端采集。数据、临时文件和生成物不提交 Git。

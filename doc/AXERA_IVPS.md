@@ -35,14 +35,14 @@ ctypes 的独立 `AX_VIDEO_FRAME_T` 与完整 `AX_IMG_INFO_T` 都带 512 字节�
 分辨率：跟随相机 config，脚本只核验 3840x2160 或 1920x1080
 ```
 
-vis 模式另有两套已确认输出：VIN 仍为左 pipe 2、右 pipe 0、chn 0、NV12 3840×2160；IVPS 为左 grp 7、右 grp 8、chn 0、灰度 640×384。它们记录在配置中，但标定录制命令只读取上述全分辨率 VIN 路径。
+vis 模式另有两套已确认输出：VIN 仍为左 pipe 2、右 pipe 0、chn 0、NV12 3840×2160；IVPS 为左 grp 7、右 grp 8、chn 0、灰度 640×384。它们仅作为文档中的接线参考，标定录制命令只读取上述全分辨率 VIN 路径。
 
 `AX_SYS_Init` 和 `AX_VIN_Init` 只附着当前 Python 进程的 SDK/VB/VIN 消费者上下文。脚本不会创建、启动、停止或重新配置 VIN/IVPS pipe/group/channel。板端应设置 `BSP_MSP_DIR=/soc/lib` 和 `LD_LIBRARY_PATH=/soc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}`；后者用于解析 `libax_proton.so` 的传递依赖。脚本同时先以全局符号方式加载 `libax_sys.so`；若同目录存在，则依次预加载 `libax_interpreter.so`、`libax_engine.so`，最后加载导出 VIN 接口的 `libax_proton.so`，作为环境遗漏时的容错。
 
 每对图像采用以下严格生命周期：
 
 1. 获取左帧和右帧。
-2. 若 PTS 差超过 2000 µs，释放较早帧并重新获取，最多 10 次。
+2. 若 PTS 差超过默认 200 µs，释放较早帧并重新获取，最多 10 次；等于 200 µs 时接受。
 3. 校验分辨率、stride、压缩模式和像素格式。
 4. 通过 `AX_SYS_MmapCache` 获取虚拟地址，并调用 `AX_SYS_MinvalidateCache`。
 5. 将有效 Y 行直接复制到可复用的 Python 自有 `bytearray`；BMP 同时形成 bottom-up 行序，JPEG 保持 top-down，不再保留中间 raw/gray 两份整图。无 NumPy 时保留逐行拷贝回退路径。

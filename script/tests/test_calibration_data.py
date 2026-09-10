@@ -3,12 +3,15 @@ from __future__ import annotations
 import ctypes
 import contextlib
 import importlib.util
+from importlib.metadata import PackageNotFoundError, version as package_version
+from types import SimpleNamespace
 import io
 import json
 import tempfile
 import threading
 import unittest
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -109,18 +112,22 @@ def make_grabber(api: FakeVinApi, tolerance_us: int = 5) -> StereoGrabber:
     )
 
 
-def create_dataset(root: Path, mode: str = "camera-imu", image_format: str = "bmp") -> Path:
+def create_dataset(
+    root: Path, mode: str = "camera-imu", image_format: str = "bmp", *, delta_us: int = 1
+) -> Path:
     output = root / "dataset"
     config = build_capture_config(
         mode=mode,
         output=str(output),
-        overrides={"resolution": "1920x1080", "save_rate_hz": 10.0, "image_format": image_format},
+        overrides={"resolution": "1920x1080", "save_rate_hz": 10.0, "image_format": image_format,
+                   "imu_preroll_s": 0, "imu_postroll_s": 0},
     )
     object.__setattr__(config, "width", 5)
     object.__setattr__(config, "height", 3)
     writer = DatasetWriter(output, config, include_imu=mode == "camera-imu")
-    writer.write_pair(make_pair(0))
-    writer.write_pair(make_pair(1))
+    for index in range(2):
+        pair = make_pair(index)
+        writer.write_pair(replace(pair, right_timestamp_ns=pair.left_timestamp_ns + delta_us * 1000))
     if mode == "camera-imu":
         for index in range(12):
             timestamp = 1_000_000_000 + index * 10_000_000
@@ -138,12 +145,67 @@ def create_dataset(root: Path, mode: str = "camera-imu", image_format: str = "bm
                 )
             )
     session = writer.seal_payload(
-        {"mode": mode, "capture_status": "completed", "capture_stats": {}}
+        {"mode": mode, "capture_status": "completed", "capture_stats": {
+            "startup_camera_timestamp_ns": 1_000_000_000,
+            "startup_imu_timestamp_ns": 1_000_000_000,
+            "startup_camera_imu_offset_ns": 0,
+        }}
     )
     report = validate_dataset(writer.staging_path)
     session["validation_status"] = report.status
     writer.write_session(session)
     return writer.commit(not report.errors)
+
+
+def make_v190_fixture(dataset: Path) -> None:
+    """Recreate the previous dual-CSV layout, strictly within test fixtures."""
+    from dataclasses import fields
+    from calib_capture.config import CaptureConfig
+    from calib_capture.dataset import capture_dataset_yaml, kalibr_manifest
+
+    session_path = dataset / "meta/session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session.pop("capture_layout")
+    session["app_version"] = "1.9.0"
+    session["schema_version"] = 3
+    config = CaptureConfig(**{item.name: session["config"][item.name] for item in fields(CaptureConfig)})
+    include_imu = config.mode == "camera-imu"
+    (dataset / "imu").mkdir(exist_ok=True)
+    csv_path = dataset / "imu/imu0.csv"
+    body = csv_path.read_bytes().split(b"\n", 1)[1] if include_imu else b""
+    csv_path.write_bytes(b"timestamp_ns,gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z\r\n" + body)
+    (dataset / "imu/imu0_kalibr.csv").write_bytes(b"timestamp_ns,wx,wy,wz,ax,ay,az\n" + body)
+    if not include_imu:
+        (dataset / "meta/imu_full.jsonl").write_text("", encoding="utf-8")
+    (dataset / "meta/capture_dataset.yaml").write_text(
+        capture_dataset_yaml(config, include_imu, session["imu_frame_id"]).replace("schema_version: 1.0.0", "schema_version: 3"), encoding="utf-8")
+    (dataset / "dataset.yaml").write_text(
+        json.dumps({"schema_version": 1, "type": "kalibr_directory_dataset", "cameras": [
+            {"topic": config.left_topic, "timestamps": "cameras/cam0/timestamps.csv", "images": "cameras/cam0"},
+            {"topic": config.right_topic, "timestamps": "cameras/cam1/timestamps.csv", "images": "cameras/cam1"}],
+            "imus": [{"topic": config.imu_topic, "data": "imu/imu0_kalibr.csv"}]}), encoding="utf-8")
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+
+
+def make_legacy_fixture(dataset: Path, version: int) -> None:
+    """Only used on temporary fixtures, never a migration of user data."""
+    make_v190_fixture(dataset)
+    session_path = dataset / "meta/session.json"
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    session["schema_version"] = version
+    session.pop("dataset_manifest")
+    if version == 1:
+        session.pop("data_integrity")
+    for key in ("imu_preroll_s", "imu_postroll_s"):
+        session["config"].pop(key)
+    session_path.write_text(json.dumps(session), encoding="utf-8")
+    sidecar = dataset / "meta/capture_dataset.yaml"
+    text = sidecar.read_text(encoding="utf-8").replace("schema_version: 3", f"schema_version: {version}")
+    if version == 1:
+        text = text.replace("data_integrity: structural\n", "")
+    (dataset / "dataset.yaml").write_text(text, encoding="utf-8")
+    sidecar.unlink()
+    (dataset / "imu/imu0_kalibr.csv").unlink()
 
 
 class BmpTests(unittest.TestCase):
@@ -317,6 +379,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.resolution, (3840, 2160))
         self.assertEqual(config.frame_divisor, 0)
         self.assertEqual(config.target_save_rate_hz, 5.0)
+        self.assertEqual(config.sync_tolerance_us, 200)
 
     def test_continuous_cli_defaults_to_five_hz_stereo(self) -> None:
         for command in ("stereo-continuous", "camera-imu"):
@@ -330,16 +393,28 @@ class ConfigTests(unittest.TestCase):
 
     def test_default_ini_matches_builtin_defaults(self) -> None:
         path = Path(__file__).resolve().parents[1] / "default_config.ini"
+        self.assertLess(set(load_ini_mapping(path)), set(DEFAULTS))
+        for mode in ("probe", "stereo-triggered", "stereo-continuous", "camera-imu"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    build_capture_config(mode=mode, config_path=str(path)),
+                    build_capture_config(mode=mode),
+                )
+
+    def test_reference_ini_covers_all_builtin_parameters(self) -> None:
+        path = Path(__file__).resolve().parents[1] / "reference_config.ini"
         self.assertEqual(set(load_ini_mapping(path)), set(DEFAULTS))
-        self.assertEqual(
-            build_capture_config(mode="camera-imu", config_path=str(path)),
-            build_capture_config(mode="camera-imu"),
-        )
+        for mode in ("probe", "stereo-triggered", "stereo-continuous", "camera-imu"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    build_capture_config(mode=mode, config_path=str(path)),
+                    build_capture_config(mode=mode),
+                )
 
     def test_ini_accepts_comments_and_utf8_bom(self) -> None:
         document = (
             "; stereo settings\n"
-            "[capture]\n"
+            "[capture]\nschema_version = 1.0.0\n"
             "# full resolution VIN\n"
             "left_pipe = 4\n"
             "left_frame_id = 左目\n"
@@ -351,7 +426,7 @@ class ConfigTests(unittest.TestCase):
                     path.write_text(document, encoding=encoding)
                     self.assertEqual(
                         load_ini_mapping(path),
-                        {"left_pipe": "4", "left_frame_id": "左目"},
+                        {"schema_version": "1.0.0", "left_pipe": "4", "left_frame_id": "左目"},
                     )
 
     def test_ini_preserves_literal_values_without_interpolation(self) -> None:
@@ -359,9 +434,9 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "capture.ini"
             path.write_text(
-                f"[capture]\nleft_frame_id = {value}\n", encoding="utf-8"
+                f"[capture]\nschema_version = 1.0.0\nleft_frame_id = {value}\n", encoding="utf-8"
             )
-            self.assertEqual(load_ini_mapping(path), {"left_frame_id": value})
+            self.assertEqual(load_ini_mapping(path), {"schema_version": "1.0.0", "left_frame_id": value})
             config = build_capture_config(mode="probe", config_path=str(path))
             self.assertEqual(config.left_frame_id, value)
 
@@ -369,7 +444,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(load_ini_mapping(None), {})
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "capture.ini"
-            for document in ("[capture]\n", "[DEFAULT]\n[capture]\n"):
+            for document in ("[capture]\nschema_version = 1.0.0\n", "[DEFAULT]\n[capture]\nschema_version = 1.0.0\n"):
                 with self.subTest(document=document):
                     path.write_text(document, encoding="utf-8")
                     self.assertEqual(
@@ -383,9 +458,9 @@ class ConfigTests(unittest.TestCase):
             "; comments only\n",
             "left_pipe = 4\n",
             "[capture\nleft_pipe = 4\n",
-            "[capture]\nleft_pipe\n",
-            "[capture]\nleft_pipe: 4\n",
-            "[capture]\nleft_frame_id = left\n  continued\n",
+            "[capture]\nschema_version = 1.0.0\nleft_pipe\n",
+            "[capture]\nschema_version = 1.0.0\nleft_pipe: 4\n",
+            "[capture]\nschema_version = 1.0.0\nleft_frame_id = left\n  continued\n",
             "[DEFAULT]\n",
             "[Capture]\nleft_pipe = 4\n",
         )
@@ -402,15 +477,15 @@ class ConfigTests(unittest.TestCase):
             path = Path(raw) / "capture.ini"
             for key in ("save_rate", "Left_pipe", "LEFT_PIPE"):
                 with self.subTest(key=key):
-                    path.write_text(f"[capture]\n{key} = 4\n", encoding="utf-8")
+                    path.write_text(f"[capture]\nschema_version = 1.0.0\n{key} = 4\n", encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, "unknown configuration"):
                         load_ini_mapping(path)
 
     def test_ini_rejects_extra_sections_and_default_inheritance(self) -> None:
         documents = (
-            "[capture]\n[hardware_layout]\n",
-            "[capture]\n[other]\nleft_pipe = 4\n",
-            "[DEFAULT]\nleft_pipe = 4\n[capture]\n",
+            "[capture]\nschema_version = 1.0.0\n[hardware_layout]\n",
+            "[capture]\nschema_version = 1.0.0\n[other]\nleft_pipe = 4\n",
+            "[DEFAULT]\nleft_pipe = 4\n[capture]\nschema_version = 1.0.0\n",
         )
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "capture.ini"
@@ -422,8 +497,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_ini_rejects_duplicate_keys_and_sections(self) -> None:
         documents = (
-            "[capture]\nleft_pipe = 2\nleft_pipe = 4\n",
-            "[capture]\n[capture]\n",
+            "[capture]\nschema_version = 1.0.0\nleft_pipe = 2\nleft_pipe = 4\n",
+            "[capture]\nschema_version = 1.0.0\n[capture]\nschema_version = 1.0.0\n",
         )
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "capture.ini"
@@ -439,9 +514,9 @@ class ConfigTests(unittest.TestCase):
             for value in ("0", "-1", "NaN", "Infinity", "-Infinity", "fast"):
                 with self.subTest(value=value):
                     path.write_text(
-                        f"[capture]\nsave_rate_hz = {value}\n", encoding="utf-8"
+                        f"[capture]\nschema_version = 1.0.0\nsave_rate_hz = {value}\n", encoding="utf-8"
                     )
-                    self.assertEqual(load_ini_mapping(path), {"save_rate_hz": value})
+                    self.assertEqual(load_ini_mapping(path), {"schema_version": "1.0.0", "save_rate_hz": value})
                     with self.assertRaises(ValueError):
                         build_capture_config(mode="camera-imu", config_path=str(path))
 
@@ -450,7 +525,7 @@ class ConfigTests(unittest.TestCase):
             for suffix in (".yaml", ".yml", ".json", ".YAML", ".JSON"):
                 with self.subTest(suffix=suffix):
                     path = Path(raw) / ("capture" + suffix)
-                    path.write_text("[capture]\nleft_pipe = 4\n", encoding="utf-8")
+                    path.write_text("[capture]\nschema_version = 1.0.0\nleft_pipe = 4\n", encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, "INI"):
                         load_ini_mapping(path)
 
@@ -458,7 +533,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "capture.ini"
             path.write_text(
-                "[capture]\n"
+                "[capture]\nschema_version = 1.0.0\n"
                 "left_pipe = 4\n"
                 "resolution = 1920x1080\n"
                 "save_rate_hz = 7.5\n",
@@ -498,7 +573,7 @@ class ConfigTests(unittest.TestCase):
             path = Path(raw) / "capture.ini"
             for values, arguments, divisor, rate_hz in cases:
                 with self.subTest(values=values, arguments=arguments):
-                    path.write_text(f"[capture]\n{values}\n", encoding="utf-8")
+                    path.write_text(f"[capture]\nschema_version = 1.0.0\n{values}\n", encoding="utf-8")
                     args = build_parser().parse_args(
                         ["--config", str(path), "stereo-continuous", *arguments]
                     )
@@ -510,7 +585,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "capture.ini"
             path.write_text(
-                "[capture]\nsave_rate_hz = 7.5\nframe_divisor = 3\n",
+                "[capture]\nschema_version = 1.0.0\nsave_rate_hz = 7.5\nframe_divisor = 3\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "mutually exclusive"):
@@ -520,7 +595,47 @@ class ConfigTests(unittest.TestCase):
         path = session_output_path(
             "./data", now=datetime(2026, 9, 7, 15, 4, 5)
         )
-        self.assertEqual(Path(path), Path("data") / "2026-09-07_15-04-05")
+        self.assertEqual(Path(path), Path("data") / "stereo_260907_1504")
+
+    def test_dataset_name_defaults_and_cli_precedence(self) -> None:
+        for mode, prefix in (("stereo-triggered", "stereo"), ("stereo-continuous", "stereo"),
+                             ("camera-imu", "stereo_imu"), ("imu-continuous", "imu")):
+            args = build_parser().parse_args([mode])
+            config = _capture_config(args, mode)
+            self.assertEqual(config.dataset_name, prefix)
+            self.assertTrue(Path(config.output).name.startswith(prefix + "_"))
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            path.write_text("[capture]\nschema_version = 1.0.0\ndataset_name = evt31\n", encoding="utf-8")
+            for arguments, prefix in (([], "evt31"), (["--dataset-name", "unit42"], "unit42")):
+                args = build_parser().parse_args(["--config", str(path), "camera-imu", *arguments])
+                self.assertEqual(_capture_config(args, args.command).dataset_name, prefix)
+
+    def test_invalid_dataset_names_and_old_ini_versions_are_rejected(self) -> None:
+        for name in ("../escape", "absolute/path", "A\\B", "中文", "_leading", "a" * 65, "a b", ".failed"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                session_output_path(dataset_name=name)
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "capture.ini"
+            for version in (None, "1", "3", "1.10.0"):
+                path.write_text("[capture]\n" + (f"schema_version = {version}\n" if version else ""), encoding="utf-8")
+                with self.subTest(version=version), self.assertRaisesRegex(ValueError, "schema_version"):
+                    load_ini_mapping(path)
+
+    def test_minute_name_collision_rejects_all_existing_states(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            for suffix in ("", ".inprogress", ".failed", ".failed.1"):
+                root = Path(raw) / ("case" + str(len(suffix)))
+                root.mkdir(exist_ok=True)
+                output = Path(session_output_path(root, dataset_name="evt31", now=datetime(2026, 9, 9, 15, 17, 1)))
+                self.assertEqual(output.name, "evt31_260909_1517")
+                self.assertEqual(str(output), session_output_path(root, dataset_name="evt31", now=datetime(2026, 9, 9, 15, 17, 59)))
+                existing = output.with_name(output.name + suffix)
+                existing.mkdir()
+                config = build_capture_config(mode="stereo-continuous", output=str(output))
+                with self.subTest(suffix=suffix), self.assertRaises(FileExistsError):
+                    DatasetWriter(output, config, False)
+                self.assertTrue(existing.exists())
 
     def test_recording_cli_defaults_to_data_root(self) -> None:
         for command in ("stereo-triggered", "stereo-continuous", "camera-imu"):
@@ -530,7 +645,7 @@ class ConfigTests(unittest.TestCase):
                 config = _capture_config(args, command)
                 output = Path(config.output)
                 self.assertEqual(output.parent, Path("data"))
-                datetime.strptime(output.name, "%Y-%m-%d_%H-%M-%S")
+                datetime.strptime(output.name.rsplit("_", 2)[-2] + "_" + output.name.rsplit("_", 2)[-1], "%y%m%d_%H%M")
 
     def test_continuous_rate_controls_are_mutually_exclusive(self) -> None:
         parser = build_parser()
@@ -568,6 +683,21 @@ class ConfigTests(unittest.TestCase):
 
 
 class StereoGrabberTests(unittest.TestCase):
+    def test_two_hundred_microsecond_boundary_and_strict_release(self) -> None:
+        for delta_us in (200, 201):
+            with self.subTest(delta_us=delta_us):
+                api = FakeVinApi({
+                    2: [make_frame(100, 1), make_frame(301, 2)],
+                    0: [make_frame(100 + delta_us, 1)],
+                })
+                grabber = make_grabber(api, build_capture_config(mode="probe").sync_tolerance_us)
+                frames = grabber.grab_frames()
+                self.assertEqual(frames.retries, int(delta_us > 200))
+                self.assertLessEqual(abs(int(frames.left.u64PTS) - int(frames.right.u64PTS)), 200)
+                grabber.release_frames(frames)
+                expected = [(2, 1), (0, 1)] if delta_us == 200 else [(2, 1), (2, 2), (0, 1)]
+                self.assertEqual(api.releases, expected)
+
     def test_resynchronizes_by_replacing_older_frame(self) -> None:
         api = FakeVinApi(
             {
@@ -749,6 +879,22 @@ class ImuSubscriberTests(unittest.TestCase):
 
 
 class DatasetTests(unittest.TestCase):
+    def test_sync_threshold_boundary_and_legacy_rejection(self) -> None:
+        for delta_us in (200, 201):
+            with self.subTest(delta_us=delta_us), tempfile.TemporaryDirectory() as raw:
+                dataset = create_dataset(Path(raw), mode="stereo-continuous", delta_us=delta_us)
+                self.assertEqual(bool(validate_dataset(dataset).errors), delta_us > 200)
+                make_legacy_fixture(dataset, 3)
+                session_path = dataset / "meta/session.json"
+                session = json.loads(session_path.read_text(encoding="utf-8"))
+                self.assertEqual(session["config"].pop("sync_tolerance_us"), 200)
+                session_path.write_text(json.dumps(session), encoding="utf-8")
+                self.assertTrue(validate_dataset(dataset).errors)
+                # An explicit tolerance cannot enable a removed legacy format.
+                session["config"]["sync_tolerance_us"] = 2000
+                session_path.write_text(json.dumps(session), encoding="utf-8")
+                self.assertTrue(validate_dataset(dataset).errors)
+
     def test_existing_failed_timestamp_directory_is_not_reused(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -771,8 +917,11 @@ class DatasetTests(unittest.TestCase):
             self.assertFalse(report.stats["checksums_verified"])
             self.assertEqual(report.stats["cam0_count"], 2)
             self.assertEqual(report.stats["imu_count"], 12)
-            contract = (dataset / "dataset.yaml").read_text(encoding="utf-8")
-            self.assertIn("schema_version: 3", contract)
+            manifest = json.loads((dataset / "dataset.yaml").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["schema_version"], "1.0.0")
+            self.assertEqual(manifest["type"], "kalibr_directory_dataset")
+            contract = (dataset / "meta/capture_dataset.yaml").read_text(encoding="utf-8")
+            self.assertIn("schema_version: 1.0.0", contract)
             self.assertIn("data_integrity: structural", contract)
             self.assertIn("capture_api: AX_VIN_GetYuvFrame", contract)
             self.assertIn("vin: {pipe: 2, chn: 0}", contract)
@@ -811,27 +960,16 @@ class DatasetTests(unittest.TestCase):
             report = validate_dataset(dataset)
             self.assertTrue(any("invalid image" in error for error in report.errors))
 
-    def test_legacy_dataset_is_readable_without_using_manifest(self) -> None:
+    def test_legacy_dataset_is_rejected_without_using_checksums(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             dataset = create_dataset(Path(raw))
-            session_path = dataset / "meta/session.json"
-            session = json.loads(session_path.read_text(encoding="utf-8"))
-            session["schema_version"] = 1
-            session.pop("data_integrity")
-            session_path.write_text(json.dumps(session), encoding="utf-8")
-            contract_path = dataset / "dataset.yaml"
-            contract_path.write_text(
-                contract_path.read_text(encoding="utf-8")
-                .replace("schema_version: 3", "schema_version: 1")
-                .replace("data_integrity: structural\n", ""),
-                encoding="utf-8",
-            )
+            make_legacy_fixture(dataset, 1)
             manifest = dataset / "meta/checksums.sha256"
             manifest.write_text("legacy manifest is ignored\n", encoding="utf-8")
             with mock.patch("hashlib.sha256", side_effect=AssertionError("unexpected hash")):
-                self.assertFalse(validate_dataset(dataset).errors)
+                self.assertTrue(validate_dataset(dataset).errors)
                 manifest.unlink()
-                self.assertFalse(validate_dataset(dataset).errors)
+                self.assertTrue(validate_dataset(dataset).errors)
 
     def test_abandoned_dataset_is_failed_and_has_validation_report(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -848,8 +986,8 @@ class DatasetTests(unittest.TestCase):
             writer.write_pair(make_pair(0))
             failed = writer.abandon(RuntimeError("simulated capture failure"))
             self.assertTrue(failed.name.endswith(".failed"))
-            self.assertTrue((failed / "validation.json").is_file())
-            report = json.loads((failed / "validation.json").read_text(encoding="utf-8"))
+            self.assertTrue((failed / "meta/validation.json").is_file())
+            report = json.loads((failed / "meta/validation.json").read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "fail")
             session = json.loads(
                 (failed / "meta/session.json").read_text(encoding="utf-8")
@@ -865,7 +1003,52 @@ def csv_row(path: Path):
         yield from csv.DictReader(stream)
 
 
-@unittest.skipUnless(importlib.util.find_spec("rosbags"), "rosbags is not installed")
+def rosbag_export_skip_reason() -> str:
+    try:
+        installed = package_version("rosbags")
+    except PackageNotFoundError:
+        return "rosbags==0.11.0 is not installed"
+    if installed != "0.11.0":
+        return f"ROS1 export needs rosbags==0.11.0; available version is {installed}"
+    if importlib.util.find_spec("numpy") is None:
+        return "NumPy is not installed"
+    return ""
+
+
+class ImuExportValueTests(unittest.TestCase):
+    def test_raw_values_stamp_and_nonempty_frame_are_preserved(self) -> None:
+        from calib_capture.ros1_export import ExportEvent, _make_imu
+
+        types = {name: SimpleNamespace for name in (
+            "builtin_interfaces/msg/Time", "std_msgs/msg/Header", "geometry_msgs/msg/Vector3",
+            "geometry_msgs/msg/Quaternion", "sensor_msgs/msg/Imu",
+        )}
+        numpy_stub = SimpleNamespace(asarray=lambda values, dtype: tuple(values), float64=float)
+        payload = ImuRecord(
+            timestamp_ns=9_876_543_210, frame_id="sensor_imu",
+            orientation=(0.1, -0.2, 0.3, 0.9), orientation_covariance=tuple(range(9)),
+            angular_velocity=(-1.5, 0.2, 0.0), angular_velocity_covariance=(0.1,) * 9,
+            linear_acceleration=(9.80665, -2.0, 3.0), linear_acceleration_covariance=(0.2,) * 9,
+            arrival_monotonic_ns=20_000_000_000,
+        ).to_json_dict()
+        for raw_frame, expected in (("sensor_imu", "sensor_imu"), ("", "configured_imu")):
+            with self.subTest(raw_frame=raw_frame):
+                payload["frame_id"] = raw_frame
+                before = json.dumps(payload)
+                event = ExportEvent(payload["timestamp_ns"], 2, "imu", 1, payload)
+                message = _make_imu(SimpleNamespace(types=types), numpy_stub, event, "configured_imu")
+                self.assertEqual(message.header.frame_id, expected)
+                self.assertEqual((message.header.stamp.sec, message.header.stamp.nanosec),
+                                 (9, 876_543_210))
+                self.assertEqual(tuple(vars(message.angular_velocity).values()), (-1.5, 0.2, 0.0))
+                self.assertEqual(tuple(vars(message.linear_acceleration).values()), (9.80665, -2.0, 3.0))
+                self.assertEqual(message.orientation_covariance, tuple(range(9)))
+                self.assertEqual(message.angular_velocity_covariance, (0.1,) * 9)
+                self.assertEqual(message.linear_acceleration_covariance, (0.2,) * 9)
+                self.assertEqual(json.dumps(payload), before)
+
+
+@unittest.skipIf(rosbag_export_skip_reason(), rosbag_export_skip_reason())
 class RosbagExportTests(unittest.TestCase):
     def test_export_and_reopen_ros1_bag(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -894,6 +1077,16 @@ class RosbagExportTests(unittest.TestCase):
                 set(result["counts"]),
                 {"/stereo/left/image_raw", "/stereo/right/image_raw"},
             )
+
+    def test_legacy_schema_one_two_three_export_is_rejected(self) -> None:
+        for schema in (1, 2, 3):
+            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                dataset = create_dataset(root)
+                make_legacy_fixture(dataset, schema)
+                with self.assertRaisesRegex(RuntimeError, "validation failed"):
+                    export_ros1_bag(dataset, root / "legacy.bag")
+                self.assertFalse((root / "legacy.bag").exists())
 
 
 if __name__ == "__main__":

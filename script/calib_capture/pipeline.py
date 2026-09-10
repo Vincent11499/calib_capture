@@ -6,6 +6,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Callable
 
 from .axera import GrayPair
 from .dataset import DatasetWriter, PendingPair
@@ -61,7 +62,7 @@ class PairDiskWriter:
     def __init__(self, dataset: DatasetWriter, capacity: int) -> None:
         self.dataset = dataset
         self.max_active = (dataset.config.image_workers + 1) // 2
-        self.queue: queue.Queue[_Work | None] = queue.Queue(maxsize=capacity)
+        self.queue: queue.Queue[_Work] = queue.Queue(maxsize=capacity)
         self.pool = BufferPool(dataset.config.width * dataset.config.height,
                                capacity + self.max_active + 1)
         self.error: BaseException | None = None
@@ -71,6 +72,7 @@ class PairDiskWriter:
         self.drain_s = 0.0
         self.timings = Timings()
         self._finish_started = False
+        self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, name="pair-commit", daemon=True)
         self._thread.start()
 
@@ -120,10 +122,7 @@ class PairDiskWriter:
             try:
                 work = self.queue.get(timeout=0.01 if pending else 0.1)
             except queue.Empty:
-                continue
-            if work is None:
-                self.queue.task_done()
-                stopping = True
+                stopping = self._stop_event.is_set()
                 continue
             if self.error is not None:
                 self._release(work)
@@ -141,13 +140,22 @@ class PairDiskWriter:
             raise RuntimeError(f"image writer failed: {self.error}") from self.error
         self.dataset.raise_if_failed()
 
-    def finish(self) -> None:
+    def finish(self, check: Callable[[], None] | None = None) -> None:
+        """Drain safely; callers may poll IMU health or cancel their wait.
+
+        Cancellation never frees buffers still used by image tasks. Calling
+        finish again without a check completes cleanup after an interruption.
+        """
         start = time.perf_counter()
-        if not self._finish_started:
-            self._finish_started = True
-            self.queue.put(None)
-        self._thread.join()
-        self.drain_s = max(self.drain_s, time.perf_counter() - start)
+        self._finish_started = True
+        self._stop_event.set()
+        try:
+            while self._thread.is_alive():
+                if check is not None:
+                    check()
+                self._thread.join(timeout=0.05)
+        finally:
+            self.drain_s = max(self.drain_s, time.perf_counter() - start)
         self.raise_if_failed()
 
     def summary(self) -> dict:
