@@ -1,0 +1,22 @@
+name: imu-utils
+services:
+  imu-utils:
+    image: kalibr-imu-utils-noetic:local
+    build:
+      context: .
+    container_name: kalibr-imu-utils-noetic
+    init: true
+    restart: unless-stopped
+    command: ["sleep", "infinity"]
+    volumes:
+      - type: bind
+        source: ../allan
+        target: /scripts
+        read_only: true
+      - type: bind
+        source: ../../../data/allan_variance/data
+        target: /data
+        read_only: true
+      - type: bind
+        source: ../../../data/allan_variance/imu_utils_output
+        target: /output

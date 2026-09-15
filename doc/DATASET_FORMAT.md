@@ -101,10 +101,26 @@ imus:
 
 ## 独立 IMU 和 ROS1
 
+Allan 指定时间区间时默认结果目录名追加 `_<起点小时>h-<终点小时>h`，整数不带小数、非整数四舍五入到一位；未给终点用 `end`。命名仅展示，不改变精确秒数选区，重名仍拒绝覆盖；显式 `--output` 不追加后缀。
+
+显式 `--kalibr-noise` 时，分析报告增加 `noise_fit` 对象（默认仍为 `not_performed`）：逐轴拟合、选段准则、三轴最大值聚合、缺失项及 YAML 文件名。拟合完整才生成标准 Kalibr `kalibr_imu.yaml`，不添加本项目 schema 字段；不完整只保留分析报告，退出码 1。该 YAML 是待审查的噪声参数候选，不是完成标定的证明。
+
+Allan 可用 `--start-s/--end-s` 选择相对第一条 IMU 的秒数区间 `[start,end)`。`analysis.json.selection` 保存请求范围、实际首末原始时间戳、源/选中样本数及两端排除数量；时序、温度和六轴统计仅针对选中段。默认全段，源文件保持只读。
+
+离线 `allan` 读取下面的独立 IMU 会话，默认将分析结果写入项目根目录下 `data/allan_variance/allantools_output/<输入目录名>/`，可用 `--output` 覆盖，不修改原始数据。输出 `analysis.json` 使用 `schema_version: "1.0.0"`、`kind: imu_allan_analysis`，记录源路径、计算方法、采样间隔统计、实际使用频率、温度摘要与警告；不拟合噪声参数。六轴 `allan_<轴名>.csv` 表头为 `tau_s,adev,avar,adev_error,n`，另有标准差及方差两张 PNG 曲线图；这些 PNG 是离线图表，不是相机采集格式。非均匀采样仅在显式允许时近似计算并告警，原始零值保留。
+
 独立 IMU CSV 现为八列 `timestamp_ns,wx,wy,wz,ax,ay,az,temperature`，仅此模式新增温度；Camera–IMU 的七列契约不变。默认同时订阅 `/imu/data`（约 100 Hz）和 `/imu/temperature`（sensor_msgs/msg/Temperature，约 1 Hz）。每条 IMU 附带最新收到的摄氏温度，不插值、不按温度 header.stamp 排序或匹配，原 IMU 时间戳保持不变。variance 不保存，NaN variance 不影响记录；温度值本身非有限则失败。
 
 启动先等到温度，再保存后续 IMU 并开始计时；之前的 IMU 为预热跳过，不缓存或倒填未来温度。缺温度/IMU 共用启动超时。温度停止更新时继续沿用旧值，沿用时间超过 2 秒只告警。session.temperature 记录话题、类型、单位、更新数、最大沿用秒数和预热跳过数。校验要求新增八列和温度 metadata，不自动修改旧七列独立采集文件。
 
 `imu-continuous` 用于后续 Allan 分析，不调用相机 SDK。只输出一份 `imu/imu0.csv`、`meta/session.json` 和 `meta/validation.json`，无双目 manifest、图像或 JSONL；session kind 为 `imu_capture_session`，layout 为 `imu_allan_csv`，版本仍为 `1.0.0`。逐行处理，不因时长无限缓存；原始单位不变。至少需要两条递增有限样本，停流／坐标系变化失败。
+
+可选 ROS1 `imu_utils` 交叉分析只读取八列 `imu/imu0.csv`，不要求输入元数据，构造只用于回放的派生 bag，但该
+文件不是本项目 `export-ros1` 的正式输出，也不属于 v1.0.0 数据集。原会话必须只读；
+bag 和 `imu_utils` 的 TXT/YAML/PNG/日志/报告统一放在独立的 `data/allan_variance/imu_utils_output/<会话名>/`。
+派生消息的 Header stamp 与 bag record time 都等于 `timestamp_ns`，六轴数值、单位、轴序
+保持不变；frame ID 由 `--frame-id` 指定，默认 `imu_link`，不是从 CSV 恢复的原始帧名；无姿态时明确标记 orientation 未知。八列 CSV 不具备原始温度消息
+的准确时间，因此不从沿用温度值伪造温度 topic。派生 bag 必须逐条回读，运行结果必须
+证明六轴 `numData` 全部等于 bag 消息数。详细流程见 [imu_utils 容器与分析说明](IMU_UTILS.md)。
 
 ROS1 导出仅用于新双目／Camera–IMU 数据，要求 PC 的 `rosbags==0.11.0`。消息 Header stamp 与 bag record time 都等于源时间；图像类型为 mono8 Image，JPEG 先解码，不能恢复压缩前像素。导出按时间归并，完成后重新打开核对类型、数量、时间范围和 Header。ROS 消息与 bag 格式属于第三方标准，不增加本项目 schema 字段；导出 JSON 报告使用 `kind: ros1_export_result`、`schema_version: "1.0.0"`。

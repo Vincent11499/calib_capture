@@ -20,6 +20,7 @@ python3 script/calibration_data.py --config script/default_config.ini camera-imu
 
 - [快速开始](doc/README.md)
 - [操作说明](doc/使用操作说明.md)
+- [ROS1 imu_utils 容器与分析](doc/IMU_UTILS.md)
 - [数据集格式与字段](doc/DATASET_FORMAT.md)
 - [AXERA 接口与 ABI](doc/AXERA_IVPS.md)
 - [维护规范](AGENTS.md)

@@ -5,6 +5,7 @@
 ## 文档
 
 - [操作说明](使用操作说明.md)：设备环境、采集参数、停止和故障处理。
+- [ROS1 imu_utils 容器与分析](IMU_UTILS.md)：PC 长期容器、独立 IMU 派生 bag、无丢帧回放、曲线和报告。
 - [数据集格式](DATASET_FORMAT.md)：目录、身份、单位、时间和元数据。
 - [AXERA VIN 与 ABI](AXERA_IVPS.md)：接口、帧所有权和映射规则。
 - [历史板端验证](BOARD_VALIDATION.md)：历史版本实测记录，不表示本版已重新上板。
@@ -26,6 +27,25 @@ python3 script/calibration_data.py imu-continuous --output ./data --duration-s 3
 `--dataset-name` 允许 1–64 个 ASCII 字母、数字、下划线或连字符，首字符须为字母或数字。留空 INI 值表示按模式自动选择 `stereo`、`stereo_imu`、`imu`。输出例如 `data/evt31_260909_1517/`，末尾固定 `_YYMMDD_hhmm`，使用设备本地时间。同名正式、录制中或失败目录存在时拒绝录制，不追加秒数或覆盖旧数据。
 
 默认 BMP 无损 mono8；可显式配置 JPEG95。有损压缩不会改变图像尺寸、时间戳和轴，但可能影响角点定位。默认双目保存 5 Hz，IMU 全部保存。Camera–IMU 图像窗前后各要求至少 1 秒 IMU，并以原始传感器时间戳核验；`duration_s` 只包含图像窗口。
+
+## PC Allan 分析
+
+指定时间区间自动命名为 `<输入名>_1h-24h`，非整数小时保留一位小数；显式 `--output` 可覆盖命名。未指定时间仍使用输入名。
+
+加 `--kalibr-noise` 可拟合并导出候选 `kalibr_imu.yaml`。若任一轴缺少可信的白噪声或随机游走区间，则不生成 YAML，缺失项写入 `analysis.json.noise_fit`，命令返回 1。默认仍只计算曲线；详见操作说明。
+
+可用 `--start-s 3600 --end-s 86400` 选择相对第一条 IMU 的第 1–24 小时，起点包含、终点不包含；不传则分析全段。多区间结果通过不同 `--output` 保存，原始数据不变。
+
+PC 环境需要 `script/requirements-allan.txt` 中的可选依赖，程序不会自动安装。读取完整独立 IMU 会话，不改原数据：
+
+```bash
+python script/calibration_data.py allan ./data/imu_260911_1400
+python script/analyze_allan.py --help
+```
+
+默认输出到项目根目录下 `data/allan_variance/allantools_output/<输入目录名>/`，不受启动工作目录影响；`--output PATH` 可覆盖完整结果目录。输出六轴 Allan 标准差/方差 CSV、两张曲线图和时序/温度报告。默认从时间戳推算采样率，明显不均匀时拒绝计算；不自动拟合 Kalibr 参数。参数和注意事项见操作说明的“PC 离线 Allan 方差分析”。
+
+需要用 ROS1 `imu_utils` 做外部交叉分析时，参见 [容器与分析说明](IMU_UTILS.md)。该流程从独立 IMU 会话生成只用于回放的派生 bag，并要求全量回读和六轴无丢帧消费；它不改变原始会话，也不扩展本项目 `export-ros1` 的支持范围。
 
 ## 配置
 
@@ -64,3 +84,8 @@ python3 -m unittest discover -s tests -v
 ```
 
 测试使用合成小数据；真实 Kalibr reader 集成检查 BMP/JPEG、话题、身份、数量和原始 IMU 值。PC ROS1 测试要求现有 `rosbags==0.11.0`，缺依赖明确跳过。板端不安装新依赖；只有获得单独授权后才执行部署和采集，部署只同步 `script/`。
+
+同一容器已加入 allan_variance_ros，直接离线读取 bag。安装、输入与输出说明见 [allan_variance_ros 使用说明](ALLAN_VARIANCE_ROS.md)。
+
+
+源码处理细节见 [allan_variance_ros 源码解读](ALLAN_VARIANCE_ROS_SOURCE.md)：预处理、分箱公式、拟合、连续时间噪声与 Kalibr YAML。

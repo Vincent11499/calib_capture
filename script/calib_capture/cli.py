@@ -136,6 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate", help="validate a directory dataset")
     validate.add_argument("dataset")
 
+    from .allan import add_options
+    allan = subparsers.add_parser("allan", help="offline six-axis Allan deviation and variance")
+    add_options(allan)
+
     export = subparsers.add_parser("export-ros1", help="export a dataset to ROS1 bag")
     export.add_argument("dataset")
     export.add_argument("bag")
@@ -184,6 +188,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "allan":
+            from .allan import analyze_allan
+            result = analyze_allan(args.dataset, output=args.output, rate_hz=args.rate_hz,
+                                   taus=args.taus, allow_irregular=args.allow_irregular,
+                                   start_s=args.start_s, end_s=args.end_s,
+                                   kalibr_noise=args.kalibr_noise, kalibr_imu_topic=args.kalibr_imu_topic)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            if args.kalibr_noise and result["noise_fit"]["status"] == "incomplete":
+                return 1
+            return 0
         if args.command == "probe":
             config = _capture_config(args, "probe")
             result = probe_hardware(config, samples=args.samples, with_imu=args.with_imu)

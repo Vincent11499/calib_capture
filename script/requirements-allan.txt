@@ -1,0 +1,4 @@
+# PC offline analysis only; do not install on the board automatically.
+allantools
+numpy
+matplotlib

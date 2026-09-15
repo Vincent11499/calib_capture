@@ -100,12 +100,24 @@
 - `write_performance` 保留每对从图像任务提交到有序提交完成的延迟统计；包含线程池/顺序等待，不包含输入等待队列、取帧或 fsync。多对重叠时累计延迟不是总录制时间。`capture_stages`、`image_stages`、`capture_stats.pipeline` 分别记录取帧/复制、编码/写入/元数据、排队/容量/排空；另记录峰值 RSS 和校验时间。统计只用固定大小累计计数器。
 - 仅 `camera-imu`、`imu-continuous` 和 `probe --with-imu` 可以依赖 ROS 2 Python 环境。
 - `imu-continuous` 为独立 Allan 原始 CSV 采集，不调用 AX API、不要求相机或图像编码库。只生成 `imu/imu0.csv` 与 `meta/session.json`、`meta/validation.json`，session 使用字符串版本 `1.0.0`、`kind: imu_capture_session`、`capture_layout: imu_allan_csv`。此模式不生成双目 Kalibr manifest，不支持现有 ROS1 导出。六轴使用原始值，CSV 与校验均流式处理；时间重复/回退、非有限值、有效 frame ID 变化或停流为失败。默认 60 秒、收到的消息全存，不使用图像限频或 IMU 前后滚。第一条消息后开始计时，Ctrl+C 可提前正常收尾；不足两条样本或异常保留 `.failed`。
+- PC 容器工具统一放 `script/imu_utils_docker/`：构建配置和补丁放 `docker/`，分析脚本放 `allan/`；仅 allan 子目录只读挂载到 `/scripts`，Compose 命令从 docker 子目录执行。输入根为 `data/allan_variance/data/`（只读），输出根为 `data/allan_variance/imu_utils_output/`；板端同步时排除 `script/imu_utils_docker/`。ROS1 `imu_utils` 仅作为 PC 外部交叉分析，不扩展项目 `export-ros1` 对独立 IMU 会话的支持范围。必须只读原始会话，把派生 bag、TXT/YAML/PNG、日志和报告写入独立的 `data/allan_variance/imu_utils_output/<会话名>/`；不得给该 bag 写 `ros1_export_result` 或改动 v1.0.0 数据契约。派生消息保持 `timestamp_ns`、六轴、单位、轴序和有效 frame ID，Header stamp 等于 record time，无姿态时显式标记未知；不得从沿用温度值伪造温度消息。
+- `imu_utils` 派生 bag 必须全量回读，核对 topic、类型、数量、时间和六轴；回放后六轴 `numData` 必须全部等于 bag 消息数。丢消息结果只能进入 `diagnostic_*`，不能作为最终参数；图像和报告只从验证通过的最终目录生成。上游 `gyr_w/acc_w` 是 bias instability 最低值，不得直接映射为 Kalibr bias random walk。
 - 写盘队列满时只丢弃完整双目对，并记录 AX 错误、源序号缺口、分频/限频跳过数及队列丢弃数。
 - 独立 `imu-continuous` 另订阅 `imu_temperature_topic`（默认 `/imu/temperature`，sensor_msgs/msg/Temperature），其 CSV 为 `timestamp_ns,wx,wy,wz,ax,ay,az,temperature`，温度为摄氏度。按回调接收顺序沿用最新温度，不做按 header 时间戳匹配或插值；variance 不使用，允许 NaN，temperature 本身必须有限。首条温度前跳过 IMU 并统计预热数，首条可保存 IMU 后计时，等待超时失败。温度不更新时继续沿用，超过 2 秒告警；不改变 camera-imu 的七列 CSV。新校验器要求八列，不修改既有七列独立 IMU 数据。
 - 源序号缺口必须在每次成功 VIN Get 后统计，包含重同步取得的帧；录制窗口在预热和 IMU 前滚之后建立新基线。同步淘汰按左右单帧独立计数，限频/分频跳过和写盘丢弃按双目对计数。保留全程 `sync_retries` 仅作诊断，不得从窗口缺口中相减；`successful_vin_get_v1` 是统计方法标识，不是文档版本。
 - 不做磁盘容量或写速硬准入；4K 数据量只提示。
 
 ## 测试要求
+
+Allan 显式时间区间默认追加小时后缀，如 `_1h-24h`、`_1.5h-5.2h`；仅起点用 `2h-end`。整数无小数，其余 ROUND_HALF_UP 一位，不影响选区。完整 `--output` 覆盖命名；显示舍入同名仍须拒绝覆盖。用户明确授权重跑替换分析结果时可备份后替换，不涉及原始采集数据。
+
+用户显式 `--kalibr-noise` 时允许 Allan 噪声拟合：-1/2 段求白噪声密度，+1/2 段求偏置随机游走（tau=3 s）。必须记录选段和误差，六轴齐全才导出候选标准 Kalibr YAML，三轴按最大值聚合；缺失不得以零、最低点或其他轴填补。未通过只保存诊断并返回非零，不得宣称候选等同于标定验收。默认无该选项仍不拟合。
+
+Allan 时间选择 `--start-s/--end-s` 按第一条原始 IMU 时间戳起算，区间 `[start,end)`；先验证完整源数据，再切片，至少四条样本。报告保留选择范围和计数，统计仅针对选中段，不能静默删除段内样本或改动源文件。
+
+Allan 默认输出固定为项目根目录下 `data/allan_variance/allantools_output/<输入目录名>/`，不随启动工作目录变化；显式 `--output` 指定完整结果目录。已有结果不覆盖，历史分析目录不迁移。
+
+`allan` / `script/analyze_allan.py` 为 PC 离线分析入口，AllanTools、NumPy、Matplotlib 必须延迟导入，不影响板端采集。只读完整独立 IMU 会话，输出到单独目录，不改源数据；时间戳 int64、六轴 float64，温度只作摘要。非均匀采样默认拒绝，显式近似必须告警；不得静默删样、插值或自动宣称拟合出 Kalibr 噪声参数。缺少真实 AllanTools 时明确跳过引擎测试，不得将测试替身当成真实计算验证。
 
 从 `script` 目录执行：
 
@@ -144,3 +156,9 @@ source /opt/ros/humble/setup.bash
 ```
 
 宿主机 `/workspace/test/Vincent` 映射到容器 `/workspace/minsky/Vincent`。板端只同步 `script/`；不要同步 `doc/`、顶层 `AGENTS.md`、`data/` 或 `tmp/`，也不要向容器映射路径重复复制。板端使用现有环境，不安装新包或库；`requirements-capture.txt` 中的 NumPy 仅用于可选加速。ROS1 bag 导出和 `rosbags` 依赖只在 PC 本机使用。
+
+ROS1 imu_utils 外部工具按用户最新要求只读取八列 imu/imu0.csv，不要求或读取 meta/session.json、meta/validation.json；帧名由 --frame-id 指定（默认 imu_link），不声称恢复原始 frame ID。此项覆盖前述外部 bag 保持有效 frame ID 的默认要求，不改变采集端契约。已移除 test_workflow.py；保留 CSV 必要读取检查、bag 回读与分析输出检查。
+
+imu_utils 每次运行输出顶层只放 bag、最终参数 YAML、三张 PNG 和 Markdown 报告；中间曲线 TXT、转换摘要、日志、验证、运行记录和源码补丁全部放 work/。验证与绘图命令的结果目录参数指向 work/。
+
+外部 imu_utils / allan_variance_ros 的 CSV→bag 与分析入口支持 --start-s/--end-s 或 --start-h/--end-h，均相对原始 CSV 首条时间戳，区间 [start,end)。完整源数据先检查，bag 和计算只使用选中样本，时间戳不归零。统计针对选段，记录源总数和选区；两个引擎比较必须使用同一选段。默认输出带小时区间后缀，保留一位小数仅用于命名，已有结果禁止覆盖。
