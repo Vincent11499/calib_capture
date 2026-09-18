@@ -261,7 +261,8 @@ def build_capture_config(
     if values["schema_version"] != APP_VERSION:
         raise ValueError(f"schema_version must be {APP_VERSION}")
     if not values["dataset_name"]:
-        values["dataset_name"] = {"camera-imu": "stereo_imu", "imu-continuous": "imu"}.get(mode, "stereo")
+        values["dataset_name"] = {"camera-imu": "stereo_imu", "imu-continuous": "imu",
+                                  "stereo-raw-triggered": "stereo_raw"}.get(mode, "stereo")
     validate_dataset_name(values["dataset_name"])
 
     width, height = parse_resolution(str(values.pop("resolution")))

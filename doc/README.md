@@ -1,91 +1,78 @@
-# calib_capture v1.0.0 快速开始
+# calib_capture 文档导航
 
-采集软件和 Kalibr no-ROS 共享 `schema_version: "1.0.0"` 数据契约。采集、求解和结果评价分别执行，采集报告的通过或警告不代表标定精度已经合格。
+## 首先阅读
 
-## 文档
+- [使用操作说明](使用操作说明.md)：板端环境、探测、六种采集命令、校验、RAW16 转 PNG
+  以及采集参数全集。
+- [数据集格式](DATASET_FORMAT.md)：目录、manifest、相机／IMU CSV、元数据和质量统计。
+- [AXERA VIN 与 ABI](AXERA_IVPS.md)：VIN/RAW 接口、帧所有权、映射和结构体约束。
 
-- [操作说明](使用操作说明.md)：设备环境、采集参数、停止和故障处理。
-- [ROS1 imu_utils 容器与分析](IMU_UTILS.md)：PC 长期容器、独立 IMU 派生 bag、无丢帧回放、曲线和报告。
-- [数据集格式](DATASET_FORMAT.md)：目录、身份、单位、时间和元数据。
-- [AXERA VIN 与 ABI](AXERA_IVPS.md)：接口、帧所有权和映射规则。
-- [历史板端验证](BOARD_VALIDATION.md)：历史版本实测记录，不表示本版已重新上板。
-- [Agent 维护规范](../AGENTS.md)。
+## PC 端 IMU 噪声分析
 
-## 录制
+- [PC 端 IMU Allan 分析总览](PC_IMU_ALLAN.md)：Python AllanTools、
+  `allan_variance_ros` 和 `imu_utils` 的统一入口、时间选区和结果对比。
+- [imu_utils 专项说明](docker/IMU_UTILS.md)：容器构建、一键流程、手动回放、验证和输出。
+- [allan_variance_ros 专项说明](docker/ALLAN_VARIANCE_ROS.md)：一键流程、复用 bag、参数和排错。
+- [allan_variance_ros 源码解读](ALLAN_VARIANCE_ROS_SOURCE.md)：分箱、拟合与 Kalibr YAML 单位。
 
-正式标定读取 cali VIN，cam0 恒为左目 pipe 2/chn 0，cam1 恒为右目 pipe 0/chn 0。源图像必须是 NV12，实际分辨率必须符合 3840×2160 或 1920×1080；脚本不缩放或重配管线。
+## 快速开始
 
-```bash
-python3 script/calibration_data.py probe --resolution 1920x1080
-python3 script/calibration_data.py stereo-triggered --output ./data --dataset-name evt31_stereo
-python3 script/calibration_data.py stereo-continuous --output ./data --duration-s 60
-python3 script/calibration_data.py --config script/default_config.ini camera-imu \
-  --output ./data --dataset-name evt31 --resolution 1920x1080
-python3 script/calibration_data.py imu-continuous --output ./data --duration-s 3600
-```
-
-`--dataset-name` 允许 1–64 个 ASCII 字母、数字、下划线或连字符，首字符须为字母或数字。留空 INI 值表示按模式自动选择 `stereo`、`stereo_imu`、`imu`。输出例如 `data/evt31_260909_1517/`，末尾固定 `_YYMMDD_hhmm`，使用设备本地时间。同名正式、录制中或失败目录存在时拒绝录制，不追加秒数或覆盖旧数据。
-
-默认 BMP 无损 mono8；可显式配置 JPEG95。有损压缩不会改变图像尺寸、时间戳和轴，但可能影响角点定位。默认双目保存 5 Hz，IMU 全部保存。Camera–IMU 图像窗前后各要求至少 1 秒 IMU，并以原始传感器时间戳核验；`duration_s` 只包含图像窗口。
-
-## PC Allan 分析
-
-指定时间区间自动命名为 `<输入名>_1h-24h`，非整数小时保留一位小数；显式 `--output` 可覆盖命名。未指定时间仍使用输入名。
-
-加 `--kalibr-noise` 可拟合并导出候选 `kalibr_imu.yaml`。若任一轴缺少可信的白噪声或随机游走区间，则不生成 YAML，缺失项写入 `analysis.json.noise_fit`，命令返回 1。默认仍只计算曲线；详见操作说明。
-
-可用 `--start-s 3600 --end-s 86400` 选择相对第一条 IMU 的第 1–24 小时，起点包含、终点不包含；不传则分析全段。多区间结果通过不同 `--output` 保存，原始数据不变。
-
-PC 环境需要 `script/requirements-allan.txt` 中的可选依赖，程序不会自动安装。读取完整独立 IMU 会话，不改原数据：
+板端容器：
 
 ```bash
-python script/calibration_data.py allan ./data/imu_260911_1400
-python script/analyze_allan.py --help
+cd /workspace/minsky/Vincent/calib_capture
+export BSP_MSP_DIR=/soc/lib
+export LD_LIBRARY_PATH=/soc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 ```
 
-默认输出到项目根目录下 `data/allan_variance/allantools_output/<输入目录名>/`，不受启动工作目录影响；`--output PATH` 可覆盖完整结果目录。输出六轴 Allan 标准差/方差 CSV、两张曲线图和时序/温度报告。默认从时间戳推算采样率，明显不均匀时拒绝计算；不自动拟合 Kalibr 参数。参数和注意事项见操作说明的“PC 离线 Allan 方差分析”。
-
-需要用 ROS1 `imu_utils` 做外部交叉分析时，参见 [容器与分析说明](IMU_UTILS.md)。该流程从独立 IMU 会话生成只用于回放的派生 bag，并要求全量回读和六轴无丢帧消费；它不改变原始会话，也不扩展本项目 `export-ros1` 的支持范围。
-
-## 配置
-
-独立 `imu-continuous` 默认还订阅 `/imu/temperature`：同一 CSV 第八列 `temperature` 为最新收到的摄氏温度，约 1 Hz 更新之间沿用上一值。先等温度再保存 IMU，超时失败；不改变 Camera–IMU CSV。可通过 `--imu-temperature-topic` 或 INI `imu_temperature_topic` 覆盖话题。
-
-`script/default_config.ini` 保持简洁，`script/reference_config.ini` 给出完整参数。显式 `--config` 放在子命令前；CLI > INI > 默认。INI 只允许 `[capture]`，必须声明版本；值不加引号，注释独立起行，不做字符串插值。
-
-```ini
-[capture]
-schema_version = 1.0.0
-; 可选；留空按模式自动命名。
-dataset_name = evt31
-resolution = 1920x1080
-image_format = bmp
-sync_tolerance_us = 200
-```
-
-## 校验与交付
+使用 IMU 时再执行：
 
 ```bash
-python3 script/calibration_data.py validate ./data/evt31_260909_1517
-python3 script/calibration_data.py export-ros1 \
-  ./data/evt31_260909_1517 ./data/evt31_260909_1517.bag
+export ROS_DOMAIN_ID=83
+source /opt/ros/humble/setup.bash
 ```
 
-新数据无需先导出 bag，Kalibr task 的目录路径指向会话目录即可。单目标定只选 cam0；双目标定选 cam0、cam1；双目–IMU 使用相机结果和按 ID 关联的 IMU 参数。目录任务不需要 topic，IMU 噪声 YAML 可省略 rostopic；bag 任务仍需要话题。独立 `imu-continuous` 只生成 Allan 分析原始 CSV 和元数据，不支持当前 ROS1 导出。
-
-`meta/validation.json` 给出结构与采集质量的 `pass/warning/fail`；异常保留 `.failed`，录制中使用 `.inprogress`。不计算逐帧 SHA-256。v1.0.0 不读取历史 schema 1/2/3，也不改名或迁移已有数据。
-
-## 验证与部署边界
+探测与采集：
 
 ```bash
-cd script
-python3 calibration_data.py self-test
-python3 -m unittest discover -s tests -v
+python3 script/calibration_data.py probe --resolution 3840x2160 --samples 50
+python3 script/calibration_data.py stereo-triggered --poses 20 --output ./data
+python3 script/calibration_data.py stereo-continuous --duration-s 60 --save-rate-hz 5 --output ./data
+python3 script/calibration_data.py camera-imu --duration-s 60 --save-rate-hz 5 --output ./data
+python3 script/calibration_data.py imu-continuous --duration-s 3600 --output ./data
 ```
 
-测试使用合成小数据；真实 Kalibr reader 集成检查 BMP/JPEG、话题、身份、数量和原始 IMU 值。PC ROS1 测试要求现有 `rosbags==0.11.0`，缺依赖明确跳过。板端不安装新依赖；只有获得单独授权后才执行部署和采集，部署只同步 `script/`。
+实验性 RAW：
 
-同一容器已加入 allan_variance_ros，直接离线读取 bag。安装、输入与输出说明见 [allan_variance_ros 使用说明](ALLAN_VARIANCE_ROS.md)。
+```bash
+python3 script/calibration_data.py stereo-raw-triggered --poses 3 --output ./data
+```
 
+PC 裸 Bayer RAW16 转彩色和灰度 PNG：
 
-源码处理细节见 [allan_variance_ros 源码解读](ALLAN_VARIANCE_ROS_SOURCE.md)：预处理、分箱公式、拟合、连续时间噪声与 Kalibr YAML。
+```powershell
+python script/raw_to_png.py image.raw
+```
+
+校验和 ROS1 bag 导出：
+
+```bash
+python3 script/calibration_data.py validate ./data/stereo_260918_1200
+```
+
+```powershell
+python script/calibration_data.py export-ros1 data/stereo_260918_1200 data/stereo_260918_1200.bag
+```
+
+## 固定约束
+
+- cam0 为左目 VIN pipe 2/chn 0，cam1 为右目 pipe 0/chn 0。
+- 正式标定源格式为 NV12，支持 3840×2160 或 1920×1080。
+- `--resolution` 只校验上游输出，不修改相机管线。
+- 默认双目保存 5 Hz、BMP、两个图像线程；IMU 全量保存。
+- 左右 PTS 差默认不超过 200 µs。
+- 输出目录为 `<output>/<dataset_name>_YYMMDD_hhmm`。
+- 采集先写 `.inprogress`，失败保留 `.failed`。
+- 板端只部署 `script/`，不安装 PC 分析依赖。
+
+维护规则见 [AGENTS.md](../AGENTS.md)。

@@ -54,6 +54,17 @@ vis 模式另有两套已确认输出：VIN 仍为左 pipe 2、右 pipe 0、chn 
 
 ## 像素格式
 
+实验命令 `stereo-raw-triggered` 另外绑定 GetRawFrame/ReleaseRawFrame，固定 IFE=0、L=0；
+获取和释放使用同一个完整 AX_IMG_INFO_T。只映射物理地址、失效缓存、复制 u32FrameSize
+到自有 bytes，再解除映射并释放两帧；写文件不持有 SDK 帧。
+它不使用以下 Y 平面提取器，不推断 RAW packing 或 Bayer 排列，不自动开启 dump。
+允许 Bayer RAW(0x80..0x87)、NONE(0) 或 LOSSLESS(1) 原字节保存；不自动重配管线，有损和未知模式明确失败。
+2026-09-15 只读板端诊断看到两侧 IFE/L 为 RAW16(0x84)、LOSSLESS(1)、
+3840×2160、u32FrameSize=12510720；此结果不是解压验证。
+参考 `tmp/sample/common/common_cam.c` 的 GetRawFrame 后续将帧直接 SendRawFrame 至
+ITP/AINR，再 ReleaseRawFrame；该段没有 CPU 解压或 RAW 文件保存实现。
+头文件同时核对 RAW 获取/释放函数签名；运行库及 ABI 基线不变。
+
 底层灰度提取器支持以下未压缩格式，便于无硬件测试和明确拒绝未知布局：
 
 - `AX_FORMAT_YUV400`

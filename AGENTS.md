@@ -42,6 +42,8 @@
 
 ## 采集契约
 
+- 临时 `stereo-raw-triggered` 独立于正式 NV12 路径。固定 `AX_VIN_GetRawFrame(pipe, IFE=0, L=0, owner, timeout)`，用同一 owner/pipe/node/exposure 严格释放；无 chn 参数。默认左右 pipe 2/0。不自动设置 dump、RunOnce、SendRawFrame 或 AE，不切换相机服务。允许未压缩及 SDK LOSSLESS(1) Bayer RAW，保存 `u32FrameSize` 原字节（保留 padding，不解包、不转灰度），格式/stride/PTS 在 `meta/pairs.jsonl`，未知 Bayer 排列明确记录 unknown。每次 Enter 后先取放约 0.2 秒帧再采集，超时失败；不声称清队列等同硬件触发。输出前缀 stereo_raw；无 IMU、Kalibr manifest、bag 支持。验证完成前不集成到 stereo-triggered。只做文件长度与配对检查，不能宣称 RAW 像素已解码验证。
+
 - `cam0` 始终是左目，`cam1` 始终是右目。
 - 默认左目 pipe 2/chn 0、右目 pipe 0/chn 0，CLI 可显式覆盖。
 - 标定输入必须为 NV12，落盘默认无损 `mono8` BMP；可配置 `image_format = jpeg`、`jpeg_quality = 95` 保存有损灰度 JPG。质量范围 1–100；JPEG 只使用 OpenCV/NumPy，不使用 Pillow，不自动安装板端依赖，不缩放图像。
@@ -108,6 +110,10 @@
 - 不做磁盘容量或写速硬准入；4K 数据量只提示。
 
 ## 测试要求
+
+PC `script/raw_to_png.py` 仅接受未压缩、非 packed 的 uint16 Bayer，默认 4K/RGGB/little-endian；
+OpenCV 显式四字母 Bayer 常量，测试必须核对红蓝通道、大小端、行 padding、有效位对齐和 PNG 回读。
+不做 SDK LOSSLESS 解压，关联 metadata 显示压缩时拒绝；原文件只读，PNG 不覆盖，PC 工具不改变采集格式。
 
 Allan 显式时间区间默认追加小时后缀，如 `_1h-24h`、`_1.5h-5.2h`；仅起点用 `2h-end`。整数无小数，其余 ROUND_HALF_UP 一位，不影响选区。完整 `--output` 覆盖命名；显示舍入同名仍须拒绝覆盖。用户明确授权重跑替换分析结果时可备份后替换，不涉及原始采集数据。
 

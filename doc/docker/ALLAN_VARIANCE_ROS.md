@@ -4,7 +4,7 @@
 
 `allan_variance_ros` 直接离线读取 bag，计算六轴 Allan 标准差，再由上游 `analysis.py` 拟合并生成图像和 Kalibr 参数候选。本项目入口另外负责 CSV 时间选区、bag 转换或复用、回读、输出检查及中文报告。
 
-算法、拟合区间与单位细节见 [源码解读](ALLAN_VARIANCE_ROS_SOURCE.md)；另一个工具见 [imu_utils 使用说明](IMU_UTILS.md)。
+算法、拟合区间与单位细节见 [源码解读](../ALLAN_VARIANCE_ROS_SOURCE.md)；另一个工具见 [imu_utils 使用说明](IMU_UTILS.md)。
 
 ## 1. 环境与目录
 
@@ -316,8 +316,8 @@ YAML 的四个噪声参数是连续时间系数，按三轴最大值聚合；陀
 
 1–23 小时测试于 2026-09-15 完成，平均采样率 100.53508534939816 Hz，首末时长 79,199.982496933 秒；之后在源码解读中独立复现了四个 YAML 噪声参数。
 
-- [1–23 小时报告](../data/allan_variance/imu_utils_output/imu_260911_1502_1h-23h_allan_variance_ros/allan_variance_ros_report.md)
-- [1–23 小时 imu.yaml](../data/allan_variance/imu_utils_output/imu_260911_1502_1h-23h_allan_variance_ros/imu.yaml)
-- [1–6 小时 allan_variance_ros 报告](../data/allan_variance/imu_utils_output/imu_260911_1502_1h-6h_allan_variance_ros/allan_variance_ros_report.md)
-- [1–6 小时 imu_utils 报告](../data/allan_variance/imu_utils_output/imu_260911_1502_1h-6h/imu_utils_report.md)
+- [1–23 小时报告](../../data/allan_variance/imu_utils_output/imu_260911_1502_1h-23h_allan_variance_ros/allan_variance_ros_report.md)
+- [1–23 小时 imu.yaml](../../data/allan_variance/imu_utils_output/imu_260911_1502_1h-23h_allan_variance_ros/imu.yaml)
+- [1–6 小时 allan_variance_ros 报告](../../data/allan_variance/imu_utils_output/imu_260911_1502_1h-6h_allan_variance_ros/allan_variance_ros_report.md)
+- [1–6 小时 imu_utils 报告](../../data/allan_variance/imu_utils_output/imu_260911_1502_1h-6h/imu_utils_report.md)
 - [上游固定版本](https://github.com/ori-drs/allan_variance_ros/tree/1d54b602ee7f2ba0427865d63afe4945d913ed24)

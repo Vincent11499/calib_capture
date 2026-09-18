@@ -31,7 +31,7 @@ flowchart TD
     I --> L[两张曲线图]
 ```
 
-运行步骤见 [容器与使用说明](ALLAN_VARIANCE_ROS.md)。本项目脚本位于 [allan 目录](../script/imu_utils_docker/allan/)。
+运行步骤见 [容器与使用说明](docker/ALLAN_VARIANCE_ROS.md)。本项目脚本位于 [allan 目录](../script/imu_utils_docker/allan/)。
 
 ## 2. 预处理：哪些是本项目做的
 

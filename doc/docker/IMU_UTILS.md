@@ -246,8 +246,7 @@ exit
 
 失败保留日志；一键分析失败详情保留在 `work/run.json` 与 `work/` 日志中。重试使用新输出目录。
 历史数据和报告不重写；旧脚本在 `legacy_20260911/`，只作归档。
-[迁移验证记录](../script/imu_utils_docker/REORGANIZATION_VALIDATION.md)描述迁移时版本；
-本次简化已删除当时使用的 test_workflow.py，输入也不再依赖元数据。
+当前简化版已删除旧的 test_workflow.py，输入不再依赖元数据。
 
 当前每次运行的输出结构：
 

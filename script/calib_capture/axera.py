@@ -245,6 +245,12 @@ def inspect_sdk_headers(include_dir: str) -> dict[str, Any]:
             result["errors"].append("AX_VIN_GetYuvFrame signature mismatch")
         if release_contract not in compact:
             result["errors"].append("AX_VIN_ReleaseYuvFrame signature mismatch")
+        for name, suffix in (("GetRawFrame", "AX_IMG_INFO_T*pImgInfo,AX_S32nTimeOutMs);"),
+                             ("ReleaseRawFrame", "constAX_IMG_INFO_T*pImgInfo);")):
+            signature = (f"AX_S32AX_VIN_{name}(AX_U8nPipeId,AX_VIN_PIPE_DUMP_NODE_EeRawId,"
+                         f"AX_SNS_HDR_FRAME_EeSnsFrame,{suffix}")
+            if signature not in compact:
+                result["errors"].append(f"AX_VIN_{name} signature mismatch")
     result["contract_match"] = not result["errors"]
     return result
 
@@ -816,8 +822,8 @@ class StereoGrabber:
                     right = None
                     self._release_one("right", old_right)
                     right = self._get("right")
-            validate_frame_metadata(left, self.expected_resolution, self.expected_format)
-            validate_frame_metadata(right, self.expected_resolution, self.expected_format)
+            self.validate_frame(left)
+            self.validate_frame(right)
             if (int(left.u32Width), int(left.u32Height)) != (
                 int(right.u32Width), int(right.u32Height)
             ):
@@ -840,6 +846,9 @@ class StereoGrabber:
             raise
         finally:
             self.timings.add("grab_and_sync", time.perf_counter_ns() - started)
+
+    def validate_frame(self, frame: AxVideoFrame) -> None:
+        validate_frame_metadata(frame, self.expected_resolution, self.expected_format)
 
     def release_frames(self, frames: StereoFrames) -> None:
         if frames.released:

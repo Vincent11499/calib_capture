@@ -4,6 +4,16 @@
 
 ## 命名和目录
 
+临时 `stereo-raw-triggered` 不属于下面的 Kalibr 目录协议：只写
+`cameras/cam0|cam1/<timestamp_ns>.raw`、`meta/pairs.jsonl`、`meta/session.json`。
+session 使用 `schema_version: "1.0.0"`、`kind: raw_capture_session`；无 dataset.yaml 或 IMU。
+pairs.jsonl 为逐对帧元数据和相对路径，保留各自原始 PTS×1000。
+原始 buffer 未解包，包含 padding，Bayer 排列未知；不能作为 mono8 读取或直接导出 bag。
+RAW 接受 Bayer RAW(0x80..0x87) + NONE(0) 或 LOSSLESS(1)。每帧记录 `compress_mode`、`compress_mode_name`、
+`compress_level`、`requires_sdk_decompression`；session 记录 `observed_compression_modes` 和
+`decompression_performed: false`。`.raw` 扩展名不代表未压缩；必须结合元数据解释。
+按 SDK 显式 frame_size 保存与核对长度，保留 padding，不根据位深推断压缩布局。
+
 会话名称为 `<dataset_name>_YYMMDD_hhmm`，例如 `evt31_260909_1517`。日期来自运行设备本地时间，只用于命名，不能当作传感器时间。session 另外记录 UTC 创建与封存时间。
 
 `--output` 是输出根目录，默认 `./data`；`dataset_name` 可由 INI 或 CLI 显式指定，默认双目 `stereo`、Camera–IMU `stereo_imu`、独立 IMU `imu`。前缀范围为 1–64 个 ASCII 字母、数字、下划线、连字符，首字符是字母或数字；空 INI 值表示模式默认。相同前缀一分钟内重复启动报错，正式目录及 `.inprogress`、`.failed` 均不覆盖。
@@ -121,6 +131,6 @@ bag 和 `imu_utils` 的 TXT/YAML/PNG/日志/报告统一放在独立的 `data/al
 派生消息的 Header stamp 与 bag record time 都等于 `timestamp_ns`，六轴数值、单位、轴序
 保持不变；frame ID 由 `--frame-id` 指定，默认 `imu_link`，不是从 CSV 恢复的原始帧名；无姿态时明确标记 orientation 未知。八列 CSV 不具备原始温度消息
 的准确时间，因此不从沿用温度值伪造温度 topic。派生 bag 必须逐条回读，运行结果必须
-证明六轴 `numData` 全部等于 bag 消息数。详细流程见 [imu_utils 容器与分析说明](IMU_UTILS.md)。
+证明六轴 `numData` 全部等于 bag 消息数。详细流程见 [imu_utils 容器与分析说明](docker/IMU_UTILS.md)。
 
 ROS1 导出仅用于新双目／Camera–IMU 数据，要求 PC 的 `rosbags==0.11.0`。消息 Header stamp 与 bag record time 都等于源时间；图像类型为 mono8 Image，JPEG 先解码，不能恢复压缩前像素。导出按时间归并，完成后重新打开核对类型、数量、时间范围和 Header。ROS 消息与 bag 格式属于第三方标准，不增加本项目 schema 字段；导出 JSON 报告使用 `kind: ros1_export_result`、`schema_version: "1.0.0"`。

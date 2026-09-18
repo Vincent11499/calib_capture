@@ -110,6 +110,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_capture_options(triggered, output=True)
 
+    raw = subparsers.add_parser("stereo-raw-triggered", help="experimental pose-by-pose IFE/L RAW dump (not Kalibr images)")
+    raw.add_argument("--output", default="./data")
+    raw.add_argument("--dataset-name", default=None)
+    for name in ("ax-lib-dir", "sdk-include-dir", "resolution"):
+        raw.add_argument("--" + name, default=None)
+    for name in ("left-pipe", "right-pipe", "poses", "sync-tolerance-us",
+                 "max-sync-retries", "capture-timeout-ms"):
+        raw.add_argument("--" + name, type=int, default=None)
+
     continuous = subparsers.add_parser(
         "stereo-continuous", help="continuous stereo capture"
     )
@@ -162,7 +171,7 @@ def _capture_config(args: argparse.Namespace, mode: str) -> CaptureConfig:
         config_path=args.config,
         overrides=overrides,
     )
-    if mode in {"stereo-triggered", "stereo-continuous", "camera-imu", "imu-continuous"}:
+    if mode in {"stereo-triggered", "stereo-raw-triggered", "stereo-continuous", "camera-imu", "imu-continuous"}:
         config = replace(config, output=session_output_path(
             str(values.get("output") or "./data"), dataset_name=config.dataset_name))
     return config
@@ -188,6 +197,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command == "stereo-raw-triggered":
+            from .raw_capture import record_raw_triggered
+            path = record_raw_triggered(_capture_config(args, args.command))
+            print(json.dumps(dict(schema_version=APP_VERSION, kind="raw_capture_result",
+                                  dataset=str(path)), ensure_ascii=False, indent=2))
+            return 0
         if args.command == "allan":
             from .allan import analyze_allan
             result = analyze_allan(args.dataset, output=args.output, rate_hz=args.rate_hz,
