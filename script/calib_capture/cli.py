@@ -11,7 +11,9 @@ from .capture import (
     probe_hardware,
     record_continuous,
     record_triggered,
+    record_base_link_triggered,
 )
+from .base_link import BASE_LINK_POSES
 from .config import (
     APP_VERSION,
     DEFAULTS,
@@ -23,10 +25,17 @@ from .config import (
 from .ros1_export import export_ros1_bag
 from .selftest import run_self_test
 from .validator import ValidationReport, validate_dataset
+from .modes import (
+    STEREO_BASELINK_MODE,
+    STEREO_IMU_MODE,
+    USB_BASELINK_MODE,
+    USB_CONTINUOUS_MODE,
+)
 
 
 def _add_capture_options(
-    parser: argparse.ArgumentParser, *, output: bool, continuous: bool = False
+    parser: argparse.ArgumentParser, *, output: bool, continuous: bool = False,
+    include_poses: bool = True,
 ) -> None:
     if output:
         parser.add_argument(
@@ -72,7 +81,8 @@ def _add_capture_options(
             ),
         )
     parser.add_argument("--duration-s", type=float, default=None)
-    parser.add_argument("--poses", type=int, default=None)
+    if include_poses:
+        parser.add_argument("--poses", type=int, default=None)
     parser.add_argument("--sync-tolerance-us", type=int, default=None)
     parser.add_argument("--max-sync-retries", type=int, default=None)
     parser.add_argument("--capture-timeout-ms", type=int, default=None)
@@ -89,9 +99,29 @@ def _add_capture_options(
     parser.add_argument("--imu-frame-id", default=None)
 
 
+def _add_usb_options(parser: argparse.ArgumentParser, *, continuous: bool) -> None:
+    parser.add_argument("--output", default="./data", metavar="DIR")
+    parser.add_argument("--dataset-name", default=None)
+    parser.add_argument("--ax-lib-dir", default=None)
+    parser.add_argument("--sdk-include-dir", default=None)
+    parser.add_argument("--image-format", choices=("bmp", "jpeg"), default=None)
+    parser.add_argument("--image-workers", type=int, default=None)
+    parser.add_argument("--jpeg-quality", type=int, default=None)
+    parser.add_argument("--capture-timeout-ms", type=int, default=None)
+    parser.add_argument("--writer-queue-pairs", type=int, default=None,
+                        help="bounded USB image queue capacity (default: 2)")
+    parser.add_argument("--expected-source-rate-hz", type=float, default=None)
+    if continuous:
+        parser.add_argument(
+            "--save-rate-hz", "--rate-hz", dest="save_rate_hz", type=float, default=None,
+            help=f"target USB image rate by PTS (default: {DEFAULTS['save_rate_hz']:g} Hz)",
+        )
+        parser.add_argument("--duration-s", type=float, default=None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Pure-Python AXERA stereo and stereo-IMU calibration data capture"
+        description="Pure-Python AXERA stereo, stereo-IMU and USB IVPS data capture"
     )
     parser.add_argument("--version", action="version", version=APP_VERSION)
     parser.add_argument(
@@ -110,6 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_capture_options(triggered, output=True)
 
+    base_link_triggered = subparsers.add_parser(
+        STEREO_BASELINK_MODE,
+        help="fixed 14-pose stereo capture for base_link calibration",
+    )
+    _add_capture_options(base_link_triggered, output=True, include_poses=False)
+
     raw = subparsers.add_parser("stereo-raw-triggered", help="experimental pose-by-pose IFE/L RAW dump (not Kalibr images)")
     raw.add_argument("--output", default="./data")
     raw.add_argument("--dataset-name", default=None)
@@ -124,12 +160,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_capture_options(continuous, output=True, continuous=True)
 
-    camera_imu = subparsers.add_parser("camera-imu", help="continuous stereo plus IMU capture")
-    _add_capture_options(camera_imu, output=True, continuous=True)
-    camera_imu.add_argument("--imu-preroll-s", type=float, default=None,
+    stereo_imu = subparsers.add_parser(STEREO_IMU_MODE, help="continuous stereo plus IMU capture")
+    _add_capture_options(stereo_imu, output=True, continuous=True)
+    stereo_imu.add_argument("--imu-preroll-s", type=float, default=None,
                             help="IMU coverage before images in seconds (default 1; 0 disables)")
-    camera_imu.add_argument("--imu-postroll-s", type=float, default=None,
+    stereo_imu.add_argument("--imu-postroll-s", type=float, default=None,
                             help="IMU coverage after images in seconds (default 1; 0 disables)")
+
+    usb_continuous = subparsers.add_parser(
+        USB_CONTINUOUS_MODE,
+        help="single USB camera capture from IVPS grp 3/chn 0 at fixed 1920x1080",
+    )
+    _add_usb_options(usb_continuous, continuous=True)
+
+    usb_baselink = subparsers.add_parser(
+        USB_BASELINK_MODE,
+        help="fixed 14-pose USB capture from IVPS grp 3/chn 0",
+    )
+    _add_usb_options(usb_baselink, continuous=False)
 
     imu_only = subparsers.add_parser("imu-continuous", help="IMU-only CSV capture for Allan analysis; no camera")
     imu_only.add_argument("--output", default="./data", metavar="DIR")
@@ -137,6 +185,10 @@ def build_parser() -> argparse.ArgumentParser:
     imu_only.add_argument("--duration-s", type=float, default=None, help="recording seconds after first sample (default 60)")
     imu_only.add_argument("--imu-topic", default=None)
     imu_only.add_argument("--imu-temperature-topic", default=None, help="sensor_msgs/Temperature topic (default /imu/temperature)")
+    imu_only.add_argument(
+        "--ignore-temperature", dest="use_temperature", action="store_false", default=None,
+        help="do not subscribe to temperature; write a seven-column IMU CSV",
+    )
     imu_only.add_argument("--imu-frame-id", default=None)
     imu_only.add_argument("--imu-expected-rate-hz", type=float, default=None, help="diagnostics only; never limits samples")
     imu_only.add_argument("--imu-qos-depth", type=int, default=None)
@@ -171,7 +223,13 @@ def _capture_config(args: argparse.Namespace, mode: str) -> CaptureConfig:
         config_path=args.config,
         overrides=overrides,
     )
-    if mode in {"stereo-triggered", "stereo-raw-triggered", "stereo-continuous", "camera-imu", "imu-continuous"}:
+    if mode in {STEREO_BASELINK_MODE, USB_BASELINK_MODE}:
+        config = replace(config, poses=len(BASE_LINK_POSES))
+    if mode in {
+        "stereo-triggered", STEREO_BASELINK_MODE, "stereo-raw-triggered",
+        "stereo-continuous", STEREO_IMU_MODE, "imu-continuous",
+        USB_CONTINUOUS_MODE, USB_BASELINK_MODE,
+    }:
         config = replace(config, output=session_output_path(
             str(values.get("output") or "./data"), dataset_name=config.dataset_name))
     return config
@@ -222,16 +280,31 @@ def main(argv: list[str] | None = None) -> int:
             path, report = record_triggered(_capture_config(args, "stereo-triggered"))
             _print_capture_result(path, report)
             return 0 if not report.errors else 1
+        if args.command == STEREO_BASELINK_MODE:
+            path, report = record_base_link_triggered(
+                _capture_config(args, STEREO_BASELINK_MODE)
+            )
+            _print_capture_result(path, report)
+            return 0 if not report.errors else 1
         if args.command == "stereo-continuous":
             path, report = record_continuous(
                 _capture_config(args, "stereo-continuous"), include_imu=False
             )
             _print_capture_result(path, report)
             return 0 if not report.errors else 1
-        if args.command == "camera-imu":
+        if args.command == STEREO_IMU_MODE:
             path, report = record_continuous(
-                _capture_config(args, "camera-imu"), include_imu=True
+                _capture_config(args, STEREO_IMU_MODE), include_imu=True
             )
+            _print_capture_result(path, report)
+            return 0 if not report.errors else 1
+        if args.command in {USB_CONTINUOUS_MODE, USB_BASELINK_MODE}:
+            from .usb_capture import record_usb_baselink_triggered, record_usb_continuous
+            config = _capture_config(args, args.command)
+            if args.command == USB_CONTINUOUS_MODE:
+                path, report = record_usb_continuous(config)
+            else:
+                path, report = record_usb_baselink_triggered(config)
             _print_capture_result(path, report)
             return 0 if not report.errors else 1
         if args.command == "validate":

@@ -8,9 +8,19 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .image_io import image_suffix, inspect_mono8_image
+from .base_link import BASE_LINK_POSES
 from .config import (CAPTURE_LAYOUT, DATASET_SCHEMA_VERSION, DEFAULTS, KALIBR_MANIFEST_MARKER,
                      CaptureConfig, SDK_HEADER_SHA256)
 from .dataset import capture_dataset_yaml, kalibr_manifest
+from .modes import (
+    STEREO_BASELINK_MODE,
+    USB_BASELINK_MODE,
+    USB_CONTINUOUS_MODE,
+    is_stereo_baselink_mode,
+    is_stereo_imu_mode,
+    is_usb_mode,
+)
+from .config import USB_IVPS_CHN, USB_IVPS_GRP, USB_RESOLUTION
 
 
 @dataclass
@@ -93,7 +103,7 @@ def _validate_kalibr_layout(
         manifest = json.loads(root_text, object_pairs_hook=_unique_object)
         if not isinstance(manifest, dict) or manifest.get("schema_version") != DATASET_SCHEMA_VERSION:
             raise ValueError("manifest must be an object with schema_version 1.0.0")
-        expected = kalibr_manifest(config, config.get("mode") == "camera-imu",
+        expected = kalibr_manifest(config, is_stereo_imu_mode(config.get("mode")),
                                    dataset_id=session["dataset_id"], imu_frame_id=session["imu_frame_id"])
         # Optional ROS export metadata is checked when present; directory
         # stream selection itself uses sensor IDs and relative paths.
@@ -109,7 +119,7 @@ def _validate_kalibr_layout(
     required = ["meta/capture_dataset.yaml"]
     if (dataset / "imu/imu0_kalibr.csv").exists():
         report.error("compact layout must not contain duplicate imu0_kalibr.csv")
-    if compact and config.get("mode") != "camera-imu":
+    if compact and not is_stereo_imu_mode(config.get("mode")):
         if (dataset / "imu").exists() or (dataset / "meta/imu_full.jsonl").exists():
             report.error("stereo-only compact layout must not contain IMU files")
     for relative in required:
@@ -123,7 +133,7 @@ def _validate_kalibr_layout(
         effective_id = session["imu_frame_id"]
         if not isinstance(effective_id, str):
             raise ValueError("session imu_frame_id must be a string")
-        expected_capture = capture_dataset_yaml(capture_config, config.get("mode") == "camera-imu",
+        expected_capture = capture_dataset_yaml(capture_config, is_stereo_imu_mode(config.get("mode")),
                                                 effective_id)
         actual_capture = (dataset / "meta/capture_dataset.yaml").read_text(encoding="utf-8")
         if actual_capture != expected_capture:
@@ -131,6 +141,256 @@ def _validate_kalibr_layout(
     except (OSError, UnicodeError, KeyError, TypeError, ValueError) as exc:
         report.error(f"invalid meta/capture_dataset.yaml: {exc}")
     return True
+
+
+def _validate_usb_dataset(
+    dataset: Path,
+    session: dict[str, Any],
+    config: dict[str, Any],
+    report: ValidationReport,
+    *,
+    write_report: bool,
+) -> ValidationReport:
+    """Validate the one-camera IVPS layout without pretending it is stereo."""
+    compact = session.get("capture_layout") == CAPTURE_LAYOUT
+    mode = str(config.get("mode", session.get("mode", "")))
+    if mode not in {USB_CONTINUOUS_MODE, USB_BASELINK_MODE}:
+        report.error(f"unsupported USB capture mode: {mode!r}")
+    if session.get("schema_version") != DATASET_SCHEMA_VERSION:
+        report.error("unsupported dataset schema_version; expected 1.0.0")
+    if session.get("kind") != "capture_session" or not compact:
+        report.error("session requires kind capture_session and capture_layout compact")
+    if session.get("data_integrity") != "structural":
+        report.error("session data_integrity must be structural")
+    if not isinstance(session.get("dataset_id"), str) or not session.get("dataset_id"):
+        report.error("session requires a nonempty dataset_id")
+    if config.get("schema_version") != DATASET_SCHEMA_VERSION:
+        report.error("capture configuration schema_version must be 1.0.0")
+    required = (
+        "dataset.yaml", "cameras/cam0/timestamps.csv", "meta/frames.csv",
+        "meta/capture_dataset.yaml", "meta/session.json",
+    )
+    for relative in required:
+        path = dataset / relative
+        if not path.is_file():
+            report.error(f"missing required file: {relative}")
+        elif not path.resolve().is_relative_to(dataset):
+            report.error(f"unsafe required file: {relative}")
+    for relative in ("cameras/cam1", "meta/pairs.csv", "imu", "meta/imu_full.jsonl"):
+        if (dataset / relative).exists():
+            report.error(f"single-camera USB dataset must not contain: {relative}")
+    if report.errors:
+        if write_report and dataset.is_dir():
+            _write_validation_report(dataset, report, compact=compact)
+        return report
+
+    try:
+        _validate_kalibr_layout(dataset, session, config, report)
+    except (OSError, UnicodeError) as exc:
+        report.error(f"cannot read dataset manifest: {exc}")
+    try:
+        width, height = int(config["width"]), int(config["height"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        width = height = 0
+        report.error("invalid USB resolution in session config")
+    if (width, height) != USB_RESOLUTION:
+        report.error(
+            f"USB resolution must be fixed at {USB_RESOLUTION[0]}x{USB_RESOLUTION[1]}"
+        )
+    stored_format = str(config.get("image_format", "bmp"))
+    try:
+        suffix = image_suffix(stored_format)
+    except ValueError as exc:
+        report.error(str(exc))
+        suffix = ".bmp"
+    if stored_format == "jpeg":
+        report.warning("JPEG storage is lossy; decoded pixels differ from the IVPS source")
+    expected_abi = {"base_size": 232, "pts_offset": 192, "sequence_offset": 200}
+    if session.get("ax_video_frame_abi") != expected_abi:
+        report.error("session AX_VIDEO_FRAME_T ABI metadata does not match the pinned contract")
+    if session.get("pinned_sdk_header_sha256") != SDK_HEADER_SHA256:
+        report.error("session pinned SDK header hashes do not match this tool's contract")
+    header_contract = session.get("sdk_header_contract")
+    if not isinstance(header_contract, dict):
+        report.error("session SDK header inspection result is invalid")
+    elif header_contract.get("present") and not header_contract.get("contract_match"):
+        report.error("runtime SDK header contract did not match during capture")
+    elif header_contract.get("present") and header_contract.get("hashes") != SDK_HEADER_SHA256:
+        report.error("runtime SDK header hashes differ from the pinned contract")
+    elif not header_contract.get("present"):
+        report.warning("SDK headers were unavailable at runtime; ctypes ABI was checked")
+    if session.get("capture_source") != {
+        "api": "AX_IVPS_GetChnFrame", "grp": USB_IVPS_GRP, "chn": USB_IVPS_CHN,
+    }:
+        report.error("session USB capture source must be AX_IVPS_GetChnFrame grp 3/chn 0")
+    if not isinstance(session.get("ax_return_errors", []), list):
+        report.error("session ax_return_errors is not a list")
+    elif session.get("ax_return_errors"):
+        report.warning("AX SDK returned nonzero/error results during USB capture")
+    try:
+        if session.get("ax_deinit_result") is not None and int(session["ax_deinit_result"]) != 0:
+            report.warning(f"AX SYS deinitialization returned {int(session['ax_deinit_result'])}")
+    except (TypeError, ValueError, OverflowError):
+        report.error("invalid ax_deinit_result in USB session metadata")
+    if str(session.get("capture_status", "")) == "failed":
+        report.error("session metadata marks the capture as failed")
+
+    try:
+        camera_rows = _read_csv(
+            dataset / "cameras/cam0/timestamps.csv", ("timestamp_ns", "filename")
+        )
+        frame_rows = _read_csv(
+            dataset / "meta/frames.csv",
+            ("frame_index", "timestamp_ns", "sequence", "source_format"),
+        )
+    except (OSError, UnicodeError, csv.Error, ValueError) as exc:
+        report.error(f"invalid USB CSV data: {exc}")
+        camera_rows, frame_rows = [], []
+    try:
+        timestamps = _timestamps(camera_rows)
+    except (KeyError, TypeError, ValueError) as exc:
+        report.error(f"invalid timestamp value in USB CSV: {exc}")
+        timestamps = []
+    if not camera_rows:
+        report.error("USB dataset contains no images")
+    if len(camera_rows) != len(frame_rows):
+        report.error(
+            f"USB count mismatch: cam0={len(camera_rows)}, frames={len(frame_rows)}"
+        )
+    if timestamps and not _strictly_increasing(timestamps):
+        report.error("cam0 timestamps are not strictly increasing")
+    if any(value < 0 or value > 2**63 - 1 for value in timestamps):
+        report.error("cam0 timestamps are outside Kalibr nonnegative int64 range")
+    previous_sequence: int | None = None
+    saved_sequence_gaps = 0
+    for index, row in enumerate(frame_rows, 1):
+        try:
+            if int(row["frame_index"]) != index:
+                raise ValueError("frame_index is not contiguous")
+            if index <= len(timestamps) and int(row["timestamp_ns"]) != timestamps[index - 1]:
+                raise ValueError("frame timestamp disagrees with cam0 timestamps.csv")
+            sequence = int(row["sequence"])
+            if previous_sequence is not None:
+                if sequence <= previous_sequence:
+                    report.warning("saved USB source sequence regressed")
+                else:
+                    saved_sequence_gaps += max(0, sequence - previous_sequence - 1)
+            previous_sequence = sequence
+            if not row["source_format"]:
+                raise ValueError("source_format is empty")
+        except (KeyError, TypeError, ValueError) as exc:
+            report.error(f"invalid meta/frames.csv line {index + 1}: {exc}")
+
+    referenced: set[str] = set()
+    for index, row in enumerate(camera_rows):
+        filename = row.get("filename", "")
+        if not filename or Path(filename).name != filename or not filename.endswith(suffix):
+            report.error(f"unsafe or invalid cam0 filename: {filename!r}")
+            continue
+        expected_stem = (
+            BASE_LINK_POSES[index]
+            if mode == USB_BASELINK_MODE and index < len(BASE_LINK_POSES)
+            else str(timestamps[index])
+        )
+        if Path(filename).stem != expected_stem:
+            report.error(
+                f"cam0 filename does not match expected stem {expected_stem!r}: {filename}"
+            )
+        referenced.add(filename)
+        path = dataset / "cameras/cam0" / filename
+        if not path.is_file():
+            report.error(f"missing image: cameras/cam0/{filename}")
+            continue
+        try:
+            info = inspect_mono8_image(path)
+            if (info.width, info.height) != USB_RESOLUTION:
+                report.error(
+                    f"wrong USB image resolution {filename}: {info.width}x{info.height}"
+                )
+        except (OSError, ValueError, RuntimeError) as exc:
+            report.error(f"invalid image cameras/cam0/{filename}: {exc}")
+    extras = {
+        path.name for path in (dataset / "cameras/cam0").iterdir()
+        if path.suffix.lower() in {".bmp", ".jpg", ".jpeg"}
+    } - referenced
+    if extras:
+        report.error("unreferenced cam0 image files: " + ", ".join(sorted(extras)[:5]))
+    if mode == USB_BASELINK_MODE and len(camera_rows) != len(BASE_LINK_POSES):
+        report.error(
+            f"USB base_link dataset has {len(camera_rows)} images; "
+            f"expected {len(BASE_LINK_POSES)}"
+        )
+    temporary_files = [
+        path.relative_to(dataset).as_posix() for path in dataset.rglob("*.tmp") if path.is_file()
+    ]
+    if temporary_files:
+        report.error("temporary files remain in dataset: " + ", ".join(temporary_files[:5]))
+    try:
+        if int(session.get("frame_count", -1)) != len(frame_rows):
+            report.error("session frame_count disagrees with frames.csv")
+        if int(session.get("pair_count", -1)) != 0 or int(session.get("imu_count", -1)) != 0:
+            report.error("USB session pair_count and imu_count must both be zero")
+    except (TypeError, ValueError, OverflowError):
+        report.error("invalid frame/pair/IMU counts in session metadata")
+    first_timestamp = timestamps[0] if timestamps else None
+    last_timestamp = timestamps[-1] if timestamps else None
+    if session.get("camera_first_timestamp_ns") != first_timestamp:
+        report.error("session camera_first_timestamp_ns disagrees with USB timestamps")
+    if session.get("camera_last_timestamp_ns") != last_timestamp:
+        report.error("session camera_last_timestamp_ns disagrees with USB timestamps")
+
+    capture_stats = session.get("capture_stats", {})
+    if not isinstance(capture_stats, dict):
+        report.error("session capture_stats is not an object")
+        capture_stats = {}
+
+    def capture_stat_int(name: str) -> int:
+        try:
+            return int(capture_stats.get(name, 0))
+        except (TypeError, ValueError, OverflowError):
+            report.error(f"invalid {name} in USB session metadata")
+            return 0
+
+    rate = _effective_rate(timestamps)
+    try:
+        target_rate = float(config.get("save_rate_hz", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        target_rate = 0.0
+        report.error("invalid USB save_rate_hz")
+    if mode == USB_CONTINUOUS_MODE and rate is not None and target_rate > 0:
+        if rate < target_rate * 0.9:
+            report.warning(
+                f"cam0 effective rate {rate:.3f} Hz is below 90% of target {target_rate:g} Hz"
+            )
+    queue_drops = capture_stat_int("writer_queue_drop_frames")
+    if queue_drops:
+        report.warning(f"writer queue dropped USB frames: {queue_drops}")
+    source_gaps = capture_stat_int("source_sequence_gaps")
+    source_regressions = capture_stat_int("source_sequence_regressions")
+    if source_gaps:
+        report.warning(f"USB source sequence gaps between successful IVPS gets: {source_gaps}")
+    if source_regressions:
+        report.warning(f"USB source sequence regressions observed: {source_regressions}")
+    report.stats = {
+        "mode": mode,
+        "cam0_count": len(camera_rows),
+        "cam1_count": 0,
+        "imu_count": 0,
+        "cam0_effective_rate_hz": rate,
+        "camera_sequence_gap_count": saved_sequence_gaps,
+        "camera_source_sequence_gap_count": source_gaps,
+        "camera_source_sequence_regression_count": source_regressions,
+        "rate_limiter_skipped_frames": capture_stat_int("rate_limiter_skipped_frames"),
+        "writer_queue_drop_frames": queue_drops,
+        "ivps_grp": USB_IVPS_GRP,
+        "ivps_chn": USB_IVPS_CHN,
+        "capture_schema_version": DATASET_SCHEMA_VERSION,
+        "data_integrity": "structural",
+        "checksums_verified": False,
+    }
+    if write_report:
+        _write_validation_report(dataset, report, compact=compact)
+    return report
 
 
 def validate_dataset(
@@ -153,7 +413,11 @@ def validate_dataset(
     if not isinstance(config, dict):
         report.error("meta/session.json config is not an object")
         config = {}
-    read_imu = config.get("mode") == "camera-imu"
+    read_imu = is_stereo_imu_mode(config.get("mode"))
+    if is_usb_mode(config.get("mode")):
+        return _validate_usb_dataset(
+            dataset, session, config, report, write_report=write_report
+        )
     if session.get("schema_version") != DATASET_SCHEMA_VERSION:
         report.error("unsupported dataset schema_version; expected 1.0.0 (no legacy compatibility)")
     if session.get("kind") != "capture_session" or not compact:
@@ -249,7 +513,8 @@ def validate_dataset(
     if str(session.get("capture_status", "")) == "failed":
         report.error("session metadata marks the capture as failed")
     mode = str(config.get("mode", session.get("mode", "")))
-    if mode not in {"stereo-triggered", "stereo-continuous", "camera-imu"}:
+    triggered_modes = {"stereo-triggered", STEREO_BASELINK_MODE, "stereo_base_link_triggered"}
+    if mode not in triggered_modes | {"stereo-continuous", "stereo-imu", "camera-imu"}:
         report.error(f"unsupported or missing capture mode: {mode!r}")
     try:
         expected_width = int(config.get("width", 0))
@@ -323,7 +588,7 @@ def validate_dataset(
             )
             if expected_topic_line not in dataset_yaml:
                 report.error(f"{metadata_file} topic disagrees with session field {key}")
-        expected_imu_enabled = "true" if mode == "camera-imu" else "false"
+        expected_imu_enabled = "true" if is_stereo_imu_mode(mode) else "false"
         if f"  enabled: {expected_imu_enabled}" not in dataset_yaml:
             report.error(f"{metadata_file} IMU enabled flag disagrees with capture mode")
     except (OSError, UnicodeError) as exc:
@@ -374,7 +639,7 @@ def validate_dataset(
         if new_layout and any(value < 0 or value > 2**63 - 1 for value in values):
             report.error(f"{name} timestamps are outside Kalibr nonnegative int64 range")
 
-    if mode == "stereo-triggered":
+    if mode in triggered_modes:
         try:
             required_poses = int(config.get("poses", 20))
         except (TypeError, ValueError, OverflowError):
@@ -382,8 +647,12 @@ def validate_dataset(
             required_poses = 20
         if len(pair_rows) != required_poses:
             report.error(f"triggered dataset has {len(pair_rows)} pairs; expected {required_poses}")
-    if mode == "camera-imu" and not imu_rows:
-        report.error("camera-imu dataset contains no IMU samples")
+        if is_stereo_baselink_mode(mode) and required_poses != len(BASE_LINK_POSES):
+            report.error(
+                f"base_link pose count is {required_poses}; expected {len(BASE_LINK_POSES)}"
+            )
+    if is_stereo_imu_mode(mode) and not imu_rows:
+        report.error("stereo-imu dataset contains no IMU samples")
 
     maximum_delta = 0.0
     sequence_gaps = 0
@@ -451,7 +720,7 @@ def validate_dataset(
 
     referenced: dict[str, set[str]] = {"cam0": set(), "cam1": set()}
     for camera, rows in (("cam0", cam0_rows), ("cam1", cam1_rows)):
-        for row in rows:
+        for row_index, row in enumerate(rows):
             filename = row.get("filename", "")
             if (
                 not filename
@@ -462,8 +731,16 @@ def validate_dataset(
                 report.error(f"unsafe or invalid {camera} filename: {filename!r}")
                 continue
             try:
-                if Path(filename).stem != str(int(row["timestamp_ns"])):
-                    report.error(f"{camera} filename does not match its timestamp: {filename}")
+                expected_stem = (
+                    BASE_LINK_POSES[row_index]
+                    if is_stereo_baselink_mode(mode) and row_index < len(BASE_LINK_POSES)
+                    else str(int(row["timestamp_ns"]))
+                )
+                if Path(filename).stem != expected_stem:
+                    report.error(
+                        f"{camera} filename does not match expected stem "
+                        f"{expected_stem!r}: {filename}"
+                    )
             except (KeyError, TypeError, ValueError):
                 report.error(f"invalid {camera} timestamp for {filename}")
                 continue
@@ -604,13 +881,13 @@ def validate_dataset(
     camera_rate0 = _effective_rate(cam0_ts)
     camera_rate1 = _effective_rate(cam1_ts)
     imu_rate = _effective_rate(imu_ts)
-    if mode != "stereo-triggered" and expected_camera_rate > 0:
+    if mode not in triggered_modes and expected_camera_rate > 0:
         for name, rate in (("cam0", camera_rate0), ("cam1", camera_rate1)):
             if rate is not None and rate < expected_camera_rate * 0.9:
                 report.warning(
                     f"{name} effective rate {rate:.3f} Hz is below 90% of target {expected_camera_rate:g} Hz"
                 )
-    if mode == "camera-imu" and expected_imu_rate > 0 and imu_rate is not None:
+    if is_stereo_imu_mode(mode) and expected_imu_rate > 0 and imu_rate is not None:
         if imu_rate < expected_imu_rate * 0.9:
             report.warning(
                 f"IMU effective rate {imu_rate:.3f} Hz is below 90% of target {expected_imu_rate:g} Hz"
@@ -636,7 +913,7 @@ def validate_dataset(
     if len(imu_ts) > 1:
         imu_gaps = [current - previous for previous, current in zip(imu_ts, imu_ts[1:])]
         imu_max_gap_ns = max(imu_gaps)
-        if mode == "camera-imu" and expected_imu_rate > 0 and math.isfinite(expected_imu_rate):
+        if is_stereo_imu_mode(mode) and expected_imu_rate > 0 and math.isfinite(expected_imu_rate):
             threshold = 2.5 * 1_000_000_000 / expected_imu_rate
             # Extreme finite metadata can still overflow division; such a rate
             # has no representable gap threshold and must not crash validation.
@@ -651,7 +928,7 @@ def validate_dataset(
                     f"{long_gap_threshold_ns / 1e6:.3f} ms; maximum is "
                     f"{imu_max_gap_ns / 1e6:.3f} ms"
                 )
-    if mode == "camera-imu" and first_camera_ns is not None and imu_ts:
+    if is_stereo_imu_mode(mode) and first_camera_ns is not None and imu_ts:
         try:
             max_offset_s = float(config.get("clock_domain_max_offset_s", 5.0))
             if not math.isfinite(max_offset_s) or max_offset_s <= 0:
@@ -742,7 +1019,7 @@ def validate_dataset(
                 f"legacy camera source sequence gaps observed: {source_gaps}; "
                 "may include synchronization discards, not a true VIN loss count"
             )
-    elif mode != "stereo-triggered" and sequence_gaps and not source_gap_metadata_present:
+    elif mode not in triggered_modes and sequence_gaps and not source_gap_metadata_present:
         report.warning(
             f"saved camera sequence gaps observed without source-gap metadata: {sequence_gaps}"
         )
@@ -755,7 +1032,7 @@ def validate_dataset(
     except (TypeError, ValueError):
         report.error("invalid source_effective_rate_hz in session metadata")
     if (
-        mode != "stereo-triggered"
+        mode not in triggered_modes
         and source_rate is not None
         and expected_source_rate > 0
         and source_rate < expected_source_rate * 0.9

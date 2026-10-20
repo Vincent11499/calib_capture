@@ -22,13 +22,19 @@ def sample(stamp=1_000_000_000, frame_id="imu_link"):
 
 
 class ImuOnlyTests(unittest.TestCase):
-    def run_capture(self, output, *, records=None, error=None, stopped=False):
+    def run_capture(self, output, *, records=None, error=None, stopped=False,
+                    use_temperature=True):
         records = records if records is not None else [sample(), sample(1_010_000_000)]
         subscriber = mock.Mock()
 
-        def construct(config, callback, *, temperature_callback):
+        def construct(
+            config, callback, *, temperature_callback,
+            allow_non_increasing_timestamps=False,
+        ):
+            self.assertTrue(allow_non_increasing_timestamps)
             def start():
-                temperature_callback(SimpleNamespace(temperature=39.0, variance=float("nan")))
+                if temperature_callback is not None:
+                    temperature_callback(SimpleNamespace(temperature=39.0, variance=float("nan")))
                 for record in records:
                     callback(record)
             subscriber.start.side_effect = start
@@ -37,7 +43,8 @@ class ImuOnlyTests(unittest.TestCase):
             return subscriber
 
         config = build_capture_config(mode="imu-continuous", output=str(output),
-                                      overrides={"duration_s": 0.001})
+                                      overrides={"duration_s": 0.001,
+                                                 "use_temperature": use_temperature})
         interrupts = SimpleNamespace(count=int(stopped), check=lambda **kwargs: None)
         with mock.patch.object(imu_only, "ImuSubscriber", side_effect=construct), \
                 mock.patch.object(imu_only, "_CaptureInterrupts",
@@ -93,12 +100,48 @@ class ImuOnlyTests(unittest.TestCase):
                 self.assertTrue(Path(str(output) + ".failed").is_dir())
 
     def test_invalid_values_stamp_and_frame_change_fail(self):
-        invalid = [sample(), sample(999), sample(1_010_000_000, "other"),
+        invalid = [sample(0), sample(1_010_000_000, "other"),
                    replace(sample(1_010_000_000), angular_velocity=(float("nan"), 0., 0.))]
         for record in invalid:
             with self.subTest(record=record), tempfile.TemporaryDirectory() as raw:
                 with self.assertRaises(RuntimeError):
                     self.run_capture(Path(raw) / "session", records=[sample(), record])
+
+    def test_timestamp_anomalies_are_retained_and_reported(self):
+        records = [
+            sample(1_000_000_000),
+            sample(1_010_000_000),
+            sample(1_005_000_000),
+            sample(1_005_000_000),
+            sample(1_020_000_000),
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            output, report = self.run_capture(Path(raw) / "session", records=records)
+            self.assertFalse(report.errors)
+            self.assertEqual(report.stats["imu_timestamp_regression_count"], 1)
+            self.assertEqual(report.stats["imu_timestamp_duplicate_count"], 1)
+            self.assertEqual(report.stats["imu_timestamp_max_regression_ns"], 5_000_000)
+            self.assertTrue(any("all arrival-order rows were retained" in item
+                                for item in report.warnings))
+            with (output / "imu/imu0.csv").open() as stream:
+                rows = list(csv.reader(stream))
+            self.assertEqual([int(row[0]) for row in rows[1:]],
+                             [record.timestamp_ns for record in records])
+            anomalies = [json.loads(line) for line in
+                         (output / "meta/imu_timestamp_anomalies.jsonl")
+                         .read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([item["classification"] for item in anomalies],
+                             ["regression", "duplicate"])
+            self.assertEqual(anomalies[0]["previous"]["timestamp_ns"], 1_010_000_000)
+            self.assertEqual(anomalies[0]["current"]["timestamp_ns"], 1_005_000_000)
+            session = json.loads((output / "meta/session.json").read_text())
+            self.assertEqual(session["timestamp_quality"], {
+                "strictly_increasing": False,
+                "anomaly_count": 2,
+                "duplicate_count": 1,
+                "regression_count": 1,
+                "maximum_regression_ns": 5_000_000,
+            })
 
     def test_flush_stall_and_write_failure(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -164,6 +207,21 @@ class ImuOnlyTests(unittest.TestCase):
         self.assertEqual(_capture_config(args, args.command).imu_temperature_topic, "/other/temp")
         with self.assertRaises(ValueError):
             build_capture_config(mode="imu-continuous", overrides={"imu_temperature_topic": "/imu/data"})
+
+    def test_ignore_temperature_writes_seven_columns_without_subscription_gate(self):
+        args = build_parser().parse_args(["imu-continuous", "--ignore-temperature"])
+        self.assertFalse(_capture_config(args, args.command).use_temperature)
+        with tempfile.TemporaryDirectory() as raw:
+            output, report = self.run_capture(
+                Path(raw) / "session", use_temperature=False)
+            self.assertFalse(report.errors)
+            with (output / "imu/imu0.csv").open() as stream:
+                rows = list(csv.reader(stream))
+            self.assertEqual(rows[0], list(imu_only.IMU_FIELDS))
+            self.assertEqual(len(rows[1]), 7)
+            session = json.loads((output / "meta/session.json").read_text())
+            self.assertFalse(session["temperature"]["enabled"])
+            self.assertFalse(report.stats["temperature_enabled"])
 
     def test_ros_temperature_subscription_gate_timeout_and_callback_error(self):
         from calib_capture.capture import ImuSubscriber

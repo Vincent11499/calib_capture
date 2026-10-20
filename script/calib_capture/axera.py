@@ -251,6 +251,20 @@ def inspect_sdk_headers(include_dir: str) -> dict[str, Any]:
                          f"AX_SNS_HDR_FRAME_EeSnsFrame,{suffix}")
             if signature not in compact:
                 result["errors"].append(f"AX_VIN_{name} signature mismatch")
+    ivps_header = root / "ax_ivps_api.h"
+    if ivps_header.is_file():
+        compact = "".join(
+            ivps_header.read_text(encoding="utf-8", errors="strict").split()
+        )
+        for name, suffix in (
+            ("GetChnFrame", "AX_VIDEO_FRAME_T*ptFrame,AX_S32nMilliSec);"),
+            ("ReleaseChnFrame", "AX_VIDEO_FRAME_T*ptFrame);"),
+        ):
+            signature = (
+                f"AX_S32AX_IVPS_{name}(IVPS_GRPIvpsGrp,IVPS_CHNIvpsChn,{suffix}"
+            )
+            if signature not in compact:
+                result["errors"].append(f"AX_IVPS_{name} signature mismatch")
     result["contract_match"] = not result["errors"]
     return result
 
@@ -513,6 +527,198 @@ class AxVinApi:
         self.close()
 
 
+def _resolve_ivps_library_dir(explicit_dir: str) -> Path | None:
+    candidates: list[Path] = []
+    if explicit_dir:
+        candidates.append(Path(explicit_dir).expanduser())
+    for variable in ("BSP_MSP_DIR", "AX_CAPTURE_LIB_DIR"):
+        if os.environ.get(variable):
+            candidates.append(Path(os.environ[variable]).expanduser())
+    candidates.append(Path("/soc/lib"))
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (candidate / "libax_sys.so").is_file() and (candidate / "libax_ivps.so").is_file():
+            return candidate.resolve()
+    if explicit_dir:
+        raise RuntimeError(
+            f"AX library directory lacks libax_sys.so/libax_ivps.so: {explicit_dir}"
+        )
+    return None
+
+
+def _load_ivps_libraries(resolved: Path | None) -> tuple[Any, list[Any], Any]:
+    mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+
+    def library_name(name: str) -> str:
+        return str(resolved / name) if resolved is not None else name
+
+    sys_library = ctypes.CDLL(library_name("libax_sys.so"), mode=mode)
+    dependencies: list[Any] = []
+    for name in ("libax_interpreter.so", "libax_engine.so"):
+        path = resolved / name if resolved is not None else None
+        if path is not None and not path.is_file():
+            continue
+        try:
+            dependencies.append(ctypes.CDLL(library_name(name), mode=mode))
+        except OSError:
+            if resolved is not None:
+                raise
+    ivps_library = ctypes.CDLL(library_name("libax_ivps.so"), mode=mode)
+    return sys_library, dependencies, ivps_library
+
+
+class AxIvpsApi:
+    """Read an existing IVPS channel without creating or reconfiguring it."""
+
+    def __init__(self, lib_dir: str, sdk_include_dir: str = "") -> None:
+        assert_ctypes_abi()
+        self.ax_errors: list[dict[str, Any]] = []
+        self.header_contract = inspect_sdk_headers(sdk_include_dir)
+        if sdk_include_dir and not self.header_contract["contract_match"]:
+            raise RuntimeError(
+                "SDK header contract mismatch: " + "; ".join(self.header_contract["errors"])
+            )
+        resolved = _resolve_ivps_library_dir(lib_dir)
+        self.library_dir = str(resolved) if resolved is not None else "dynamic-loader search path"
+        try:
+            self._sys, self._dependency_handles, self._ivps = _load_ivps_libraries(
+                resolved
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                "failed to load AX SYS/IVPS libraries; set --ax-lib-dir or "
+                "LD_LIBRARY_PATH: " + str(exc)
+            ) from exc
+
+        self._sys.AX_SYS_Init.argtypes = []
+        self._sys.AX_SYS_Init.restype = ctypes.c_int32
+        self._sys.AX_SYS_Deinit.argtypes = []
+        self._sys.AX_SYS_Deinit.restype = ctypes.c_int32
+        self._sys.AX_SYS_MmapCache.argtypes = [ctypes.c_uint64, ctypes.c_uint32]
+        self._sys.AX_SYS_MmapCache.restype = ctypes.c_void_p
+        self._sys.AX_SYS_MinvalidateCache.argtypes = [
+            ctypes.c_uint64, ctypes.c_void_p, ctypes.c_uint32
+        ]
+        self._sys.AX_SYS_MinvalidateCache.restype = ctypes.c_int32
+        self._sys.AX_SYS_Munmap.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self._sys.AX_SYS_Munmap.restype = ctypes.c_int32
+        self._ivps.AX_IVPS_GetChnFrame.argtypes = [
+            ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(AxVideoFrame), ctypes.c_int32
+        ]
+        self._ivps.AX_IVPS_GetChnFrame.restype = ctypes.c_int32
+        self._ivps.AX_IVPS_ReleaseChnFrame.argtypes = [
+            ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(AxVideoFrame)
+        ]
+        self._ivps.AX_IVPS_ReleaseChnFrame.restype = ctypes.c_int32
+        self.sys_initialized = False
+        result = int(self._sys.AX_SYS_Init())
+        if result != 0:
+            self._record_error("AX_SYS_Init", result)
+            raise RuntimeError(f"AX_SYS_Init failed: {ax_return_code_text(result)}")
+        self.sys_initialized = True
+
+    def _record_error(self, call: str, result: int | None, **context: Any) -> None:
+        item: dict[str, Any] = {"call": call, **context}
+        if result is None:
+            item["result"] = "NULL"
+        else:
+            item["result"] = int(result)
+            item["result_hex"] = ax_return_code_text(result)
+        self.ax_errors.append(item)
+
+    def get_frame(self, grp: int, chn: int, timeout_ms: int, frame: AxVideoFrame) -> int:
+        for index in range(len(frame._abi_tail_guard)):
+            frame._abi_tail_guard[index] = ABI_GUARD_BYTE
+        result = int(
+            self._ivps.AX_IVPS_GetChnFrame(grp, chn, ctypes.byref(frame), timeout_ms)
+        )
+        if result != 0:
+            self._record_error(
+                "AX_IVPS_GetChnFrame", result, grp=grp, chn=chn, timeout_ms=timeout_ms
+            )
+            return result
+        frame._ivps_owned = True
+        if any(value != ABI_GUARD_BYTE for value in frame._abi_tail_guard):
+            self._record_error("AX_VIDEO_FRAME_T_tail_guard", None, grp=grp, chn=chn)
+            release_result = self.release_frame(grp, chn, frame)
+            raise RuntimeError(
+                "AX_IVPS_GetChnFrame wrote beyond the pinned 232-byte AX_VIDEO_FRAME_T"
+                + (
+                    f"; release returned {ax_return_code_text(release_result)}"
+                    if release_result != 0 else ""
+                )
+            )
+        return 0
+
+    def release_frame(self, grp: int, chn: int, frame: AxVideoFrame) -> int:
+        if not getattr(frame, "_ivps_owned", False):
+            raise RuntimeError("IVPS frame is not owned or was already released")
+        result = int(self._ivps.AX_IVPS_ReleaseChnFrame(grp, chn, ctypes.byref(frame)))
+        frame._ivps_owned = False
+        if result != 0:
+            self._record_error(
+                "AX_IVPS_ReleaseChnFrame", result, grp=grp, chn=chn,
+                sequence=int(frame.u64SeqNum), timestamp_us=int(frame.u64PTS),
+            )
+        return result
+
+    def map_frame(self, frame: AxVideoFrame) -> tuple[int, int, bool]:
+        map_size = frame_map_size(frame)
+        if map_size <= 0 or int(frame.u64PhyAddr[0]) == 0:
+            raise RuntimeError("frame has no mappable physical buffer")
+        raw_pointer = self._sys.AX_SYS_MmapCache(int(frame.u64PhyAddr[0]), map_size)
+        if not raw_pointer:
+            self._record_error(
+                "AX_SYS_MmapCache", None,
+                physical_address=int(frame.u64PhyAddr[0]), size=map_size,
+            )
+            raise RuntimeError("AX_SYS_MmapCache returned NULL")
+        pointer = int(raw_pointer)
+        result = int(self._sys.AX_SYS_MinvalidateCache(
+            int(frame.u64PhyAddr[0]), ctypes.c_void_p(pointer), map_size
+        ))
+        if result != 0:
+            self._record_error(
+                "AX_SYS_MinvalidateCache", result,
+                physical_address=int(frame.u64PhyAddr[0]), size=map_size,
+            )
+            cleanup_result = int(self._sys.AX_SYS_Munmap(ctypes.c_void_p(pointer), map_size))
+            if cleanup_result != 0:
+                self._record_error(
+                    "AX_SYS_Munmap", cleanup_result, size=map_size,
+                    during="AX_SYS_MinvalidateCache cleanup",
+                )
+            raise RuntimeError(f"AX_SYS_MinvalidateCache failed: {ax_return_code_text(result)}")
+        return pointer, map_size, True
+
+    def unmap_frame(self, pointer: int, map_size: int, mapped_here: bool) -> None:
+        if not mapped_here:
+            return
+        result = int(self._sys.AX_SYS_Munmap(ctypes.c_void_p(pointer), map_size))
+        if result != 0:
+            self._record_error("AX_SYS_Munmap", result, size=map_size)
+            raise RuntimeError(f"AX_SYS_Munmap failed: {ax_return_code_text(result)}")
+
+    def close(self) -> int:
+        if not self.sys_initialized:
+            return 0
+        self.sys_initialized = False
+        result = int(self._sys.AX_SYS_Deinit())
+        if result != 0:
+            self._record_error("AX_SYS_Deinit", result)
+        return result
+
+    def __enter__(self) -> "AxIvpsApi":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+
 def frame_map_size(frame: AxVideoFrame) -> int:
     if int(frame.u32FrameSize) > 0:
         return int(frame.u32FrameSize)
@@ -642,6 +848,162 @@ def copy_y_plane(pointer: int, width: int, height: int, stride: int,
         source = np.frombuffer(mapped, dtype=np.uint8).reshape(height, stride)[:, :width]
         target = np.frombuffer(destination, dtype=np.uint8).reshape(height, width)
         np.copyto(target, source[::-1] if bottom_up else source)
+
+
+@dataclass(frozen=True)
+class GrayFrame:
+    timestamp_ns: int
+    sequence: int
+    width: int
+    height: int
+    pixels: bytes | bytearray
+    source_format: int
+    bottom_up: bool = False
+
+
+class IvpsGrabber:
+    """Single-channel IVPS reader with strict map/copy/unmap/release rules."""
+
+    def __init__(
+        self,
+        api: AxIvpsApi,
+        *,
+        grp: int,
+        chn: int,
+        timeout_ms: int,
+        expected_resolution: tuple[int, int],
+    ) -> None:
+        self.api = api
+        self.grp = grp
+        self.chn = chn
+        self.timeout_ms = timeout_ms
+        self.expected_resolution = expected_resolution
+        self.timings = Timings()
+        self.previous_sequence: int | None = None
+        self.stats: dict[str, int | str] = {
+            "get_calls": 0,
+            "get_errors": 0,
+            "release_errors": 0,
+            "source_acquired_frames": 0,
+            "source_sequence_gaps": 0,
+            "source_sequence_regressions": 0,
+            "source_sequence_accounting": "successful_ivps_get_v1",
+        }
+
+    def start_sequence_window(self) -> None:
+        self.previous_sequence = None
+        for key in (
+            "source_acquired_frames", "source_sequence_gaps", "source_sequence_regressions"
+        ):
+            self.stats[key] = 0
+
+    def grab_frame(self) -> AxVideoFrame:
+        started = time.perf_counter_ns()
+        frame = AxVideoFrame()
+        self.stats["get_calls"] = int(self.stats["get_calls"]) + 1
+        result = self.api.get_frame(self.grp, self.chn, self.timeout_ms, frame)
+        if result != 0:
+            self.stats["get_errors"] = int(self.stats["get_errors"]) + 1
+            raise RuntimeError(
+                f"AX_IVPS_GetChnFrame(grp={self.grp}, chn={self.chn}) failed: "
+                f"{ax_return_code_text(result)}"
+            )
+        try:
+            validate_frame_metadata(frame, self.expected_resolution, None)
+            sequence = int(frame.u64SeqNum)
+            previous = self.previous_sequence
+            self.stats["source_acquired_frames"] = int(self.stats["source_acquired_frames"]) + 1
+            if previous is not None:
+                self.stats["source_sequence_gaps"] = (
+                    int(self.stats["source_sequence_gaps"]) + max(0, sequence - previous - 1)
+                )
+                self.stats["source_sequence_regressions"] = (
+                    int(self.stats["source_sequence_regressions"]) + int(sequence <= previous)
+                )
+            self.previous_sequence = sequence
+            return frame
+        except BaseException:
+            self.release_frame(frame)
+            raise
+        finally:
+            self.timings.add("grab", time.perf_counter_ns() - started)
+
+    def release_frame(self, frame: AxVideoFrame) -> None:
+        result = self.api.release_frame(self.grp, self.chn, frame)
+        if result != 0:
+            self.stats["release_errors"] = int(self.stats["release_errors"]) + 1
+            raise RuntimeError(
+                f"AX_IVPS_ReleaseChnFrame(grp={self.grp}, chn={self.chn}) failed: "
+                f"{ax_return_code_text(result)}"
+            )
+
+    def copy_gray_frame(
+        self,
+        frame: AxVideoFrame,
+        *,
+        release_after_copy: bool = False,
+        buffer: bytearray | None = None,
+        bottom_up: bool = False,
+    ) -> GrayFrame:
+        width, height = int(frame.u32Width), int(frame.u32Height)
+        if buffer is None:
+            buffer = bytearray(width * height)
+        if len(buffer) != width * height:
+            raise ValueError("USB image buffer size differs from frame resolution")
+        pointer = map_size = 0
+        mapped_here = False
+        try:
+            started = time.perf_counter_ns()
+            pointer, map_size, mapped_here = self.api.map_frame(frame)
+            self.timings.add("map_and_invalidate", time.perf_counter_ns() - started)
+            started = time.perf_counter_ns()
+            stride = int(frame.u32PicStride[0])
+            image_format = int(frame.enImgFormat)
+            if image_format in (AX_FORMAT_RGB888, AX_FORMAT_BGR888):
+                raw = ctypes.string_at(pointer, stride * height)
+                gray = packed_frame_to_gray(raw, width, height, stride, image_format)
+                if bottom_up:
+                    for row in range(height):
+                        source = (height - 1 - row) * width
+                        buffer[row * width:(row + 1) * width] = gray[source:source + width]
+                else:
+                    buffer[:] = gray
+            else:
+                copy_y_plane(pointer, width, height, stride, buffer, bottom_up)
+            self.timings.add("copy_y", time.perf_counter_ns() - started)
+            return GrayFrame(
+                timestamp_ns=int(frame.u64PTS) * 1000,
+                sequence=int(frame.u64SeqNum),
+                width=width,
+                height=height,
+                pixels=buffer,
+                source_format=image_format,
+                bottom_up=bottom_up,
+            )
+        finally:
+            try:
+                if pointer:
+                    started = time.perf_counter_ns()
+                    self.api.unmap_frame(pointer, map_size, mapped_here)
+                    self.timings.add("unmap", time.perf_counter_ns() - started)
+            finally:
+                if release_after_copy and getattr(frame, "_ivps_owned", False):
+                    self.release_frame(frame)
+
+    def describe_frame(self, frame: AxVideoFrame) -> dict[str, Any]:
+        return {
+            "ivps_grp": self.grp,
+            "ivps_chn": self.chn,
+            "width": int(frame.u32Width),
+            "height": int(frame.u32Height),
+            "format": int(frame.enImgFormat),
+            "format_name": FORMAT_NAMES.get(int(frame.enImgFormat), "unknown"),
+            "stride": int(frame.u32PicStride[0]),
+            "frame_size": int(frame.u32FrameSize),
+            "compress_mode": int(frame.stCompressInfo.enCompressMode),
+            "timestamp_us": int(frame.u64PTS),
+            "sequence": int(frame.u64SeqNum),
+        }
 
 
 @dataclass(frozen=True)

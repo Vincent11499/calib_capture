@@ -113,7 +113,14 @@ def analyze_allan(dataset, *, output=None, rate_hz=None, taus="decade", allow_ir
     if validation.errors:
         raise ValueError("invalid IMU dataset: " + "; ".join(validation.errors))
     # Typed load keeps nanosecond timestamps integral and all sensor values float64.
-    dtype = [("timestamp_ns", "i8")] + [(name, "f8") for name in (*AXES, "temperature")]
+    with (source / "imu/imu0.csv").open(encoding="utf-8", newline="") as stream:
+        header = tuple(next(csv.reader(stream), ()))
+    has_temperature = header == ("timestamp_ns", *AXES, "temperature")
+    if not has_temperature and header != ("timestamp_ns", *AXES):
+        raise ValueError("unsupported IMU CSV header")
+    dtype = [("timestamp_ns", "i8")] + [(name, "f8") for name in AXES]
+    if has_temperature:
+        dtype.append(("temperature", "f8"))
     data = np.loadtxt(source / "imu/imu0.csv", delimiter=",", skiprows=1, dtype=dtype, ndmin=1)
     data, selection = select_time_window(data, 0.0 if start_s is None else start_s, end_s)
     timing = timing_summary(data["timestamp_ns"], rate_hz)
@@ -138,9 +145,11 @@ def analyze_allan(dataset, *, output=None, rate_hz=None, taus="decade", allow_ir
         "data_type": "freq", "taus": taus, "timing": timing, "warnings": warnings,
         "selection": selection,
         "allow_irregular": allow_irregular, "resampled": False, "noise_fit": "not_performed",
-        "temperature": {"unit": "degC", "minimum": float(data["temperature"].min()),
-                        "maximum": float(data["temperature"].max()),
-                        "mean": float(data["temperature"].mean())}, "axes": {},
+        "temperature": ({"available": True, "unit": "degC",
+                         "minimum": float(data["temperature"].min()),
+                         "maximum": float(data["temperature"].max()),
+                         "mean": float(data["temperature"].mean())}
+                        if has_temperature else {"available": False}), "axes": {},
     }
     staging.mkdir(parents=True)
     try:

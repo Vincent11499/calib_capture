@@ -113,7 +113,7 @@ def make_grabber(api: FakeVinApi, tolerance_us: int = 5) -> StereoGrabber:
 
 
 def create_dataset(
-    root: Path, mode: str = "camera-imu", image_format: str = "bmp", *, delta_us: int = 1
+    root: Path, mode: str = "stereo-imu", image_format: str = "bmp", *, delta_us: int = 1
 ) -> Path:
     output = root / "dataset"
     config = build_capture_config(
@@ -124,11 +124,11 @@ def create_dataset(
     )
     object.__setattr__(config, "width", 5)
     object.__setattr__(config, "height", 3)
-    writer = DatasetWriter(output, config, include_imu=mode == "camera-imu")
+    writer = DatasetWriter(output, config, include_imu=mode == "stereo-imu")
     for index in range(2):
         pair = make_pair(index)
         writer.write_pair(replace(pair, right_timestamp_ns=pair.left_timestamp_ns + delta_us * 1000))
-    if mode == "camera-imu":
+    if mode == "stereo-imu":
         for index in range(12):
             timestamp = 1_000_000_000 + index * 10_000_000
             writer.write_imu(
@@ -169,7 +169,7 @@ def make_v190_fixture(dataset: Path) -> None:
     session["app_version"] = "1.9.0"
     session["schema_version"] = 3
     config = CaptureConfig(**{item.name: session["config"][item.name] for item in fields(CaptureConfig)})
-    include_imu = config.mode == "camera-imu"
+    include_imu = config.mode == "stereo-imu"
     (dataset / "imu").mkdir(exist_ok=True)
     csv_path = dataset / "imu/imu0.csv"
     body = csv_path.read_bytes().split(b"\n", 1)[1] if include_imu else b""
@@ -382,7 +382,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.sync_tolerance_us, 200)
 
     def test_continuous_cli_defaults_to_five_hz_stereo(self) -> None:
-        for command in ("stereo-continuous", "camera-imu"):
+        for command in ("stereo-continuous", "stereo-imu"):
             with self.subTest(command=command):
                 args = build_parser().parse_args([command])
                 config = _capture_config(args, command)
@@ -394,7 +394,7 @@ class ConfigTests(unittest.TestCase):
     def test_default_ini_matches_builtin_defaults(self) -> None:
         path = Path(__file__).resolve().parents[1] / "default_config.ini"
         self.assertLess(set(load_ini_mapping(path)), set(DEFAULTS))
-        for mode in ("probe", "stereo-triggered", "stereo-continuous", "camera-imu"):
+        for mode in ("probe", "stereo-triggered", "stereo-continuous", "stereo-imu"):
             with self.subTest(mode=mode):
                 self.assertEqual(
                     build_capture_config(mode=mode, config_path=str(path)),
@@ -404,7 +404,7 @@ class ConfigTests(unittest.TestCase):
     def test_reference_ini_covers_all_builtin_parameters(self) -> None:
         path = Path(__file__).resolve().parents[1] / "reference_config.ini"
         self.assertEqual(set(load_ini_mapping(path)), set(DEFAULTS))
-        for mode in ("probe", "stereo-triggered", "stereo-continuous", "camera-imu"):
+        for mode in ("probe", "stereo-triggered", "stereo-continuous", "stereo-imu"):
             with self.subTest(mode=mode):
                 self.assertEqual(
                     build_capture_config(mode=mode, config_path=str(path)),
@@ -518,7 +518,7 @@ class ConfigTests(unittest.TestCase):
                     )
                     self.assertEqual(load_ini_mapping(path), {"schema_version": "1.0.0", "save_rate_hz": value})
                     with self.assertRaises(ValueError):
-                        build_capture_config(mode="camera-imu", config_path=str(path))
+                        build_capture_config(mode="stereo-imu", config_path=str(path))
 
     def test_old_config_extensions_explain_ini_migration(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -560,7 +560,7 @@ class ConfigTests(unittest.TestCase):
     def test_rate_controls_are_rejected_together_in_one_config_layer(self) -> None:
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             build_capture_config(
-                mode="camera-imu",
+                mode="stereo-imu",
                 overrides={"save_rate_hz": 7.5, "frame_divisor": 5},
             )
 
@@ -589,7 +589,7 @@ class ConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-                build_capture_config(mode="camera-imu", config_path=str(path))
+                build_capture_config(mode="stereo-imu", config_path=str(path))
 
     def test_session_output_uses_timestamp_subdirectory(self) -> None:
         path = session_output_path(
@@ -599,7 +599,8 @@ class ConfigTests(unittest.TestCase):
 
     def test_dataset_name_defaults_and_cli_precedence(self) -> None:
         for mode, prefix in (("stereo-triggered", "stereo"), ("stereo-continuous", "stereo"),
-                             ("camera-imu", "stereo_imu"), ("imu-continuous", "imu")):
+                             ("stereo-baselink-triggered", "stereo_base_link"),
+                             ("stereo-imu", "stereo_imu"), ("imu-continuous", "imu")):
             args = build_parser().parse_args([mode])
             config = _capture_config(args, mode)
             self.assertEqual(config.dataset_name, prefix)
@@ -608,7 +609,7 @@ class ConfigTests(unittest.TestCase):
             path = Path(raw) / "capture.ini"
             path.write_text("[capture]\nschema_version = 1.0.0\ndataset_name = evt31\n", encoding="utf-8")
             for arguments, prefix in (([], "evt31"), (["--dataset-name", "unit42"], "unit42")):
-                args = build_parser().parse_args(["--config", str(path), "camera-imu", *arguments])
+                args = build_parser().parse_args(["--config", str(path), "stereo-imu", *arguments])
                 self.assertEqual(_capture_config(args, args.command).dataset_name, prefix)
 
     def test_invalid_dataset_names_and_old_ini_versions_are_rejected(self) -> None:
@@ -638,7 +639,8 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(existing.exists())
 
     def test_recording_cli_defaults_to_data_root(self) -> None:
-        for command in ("stereo-triggered", "stereo-continuous", "camera-imu"):
+        for command in ("stereo-triggered", "stereo-baselink-triggered",
+                        "stereo-continuous", "stereo-imu"):
             with self.subTest(command=command):
                 args = build_parser().parse_args([command])
                 self.assertEqual(args.output, "./data")
@@ -646,6 +648,17 @@ class ConfigTests(unittest.TestCase):
                 output = Path(config.output)
                 self.assertEqual(output.parent, Path("data"))
                 datetime.strptime(output.name.rsplit("_", 2)[-2] + "_" + output.name.rsplit("_", 2)[-1], "%y%m%d_%H%M")
+
+    def test_base_link_cli_has_fixed_pose_count_and_default_4k(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["stereo-baselink-triggered"])
+        config = _capture_config(args, args.command)
+        self.assertEqual((config.width, config.height), (3840, 2160))
+        self.assertEqual(config.poses, 14)
+        self.assertEqual(config.dataset_name, "stereo_base_link")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["stereo-baselink-triggered", "--poses", "3"])
 
     def test_continuous_rate_controls_are_mutually_exclusive(self) -> None:
         parser = build_parser()
@@ -871,7 +884,7 @@ class QueueTests(unittest.TestCase):
 
 class ImuSubscriberTests(unittest.TestCase):
     def test_stop_reports_last_callback_failure(self) -> None:
-        subscriber = ImuSubscriber(build_capture_config(mode="camera-imu"))
+        subscriber = ImuSubscriber(build_capture_config(mode="stereo-imu"))
         subscriber.error = ValueError("late callback")
         with self.assertRaisesRegex(RuntimeError, "late callback"):
             subscriber.stop()

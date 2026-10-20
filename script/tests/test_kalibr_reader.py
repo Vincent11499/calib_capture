@@ -33,7 +33,7 @@ class KalibrReaderIntegrationTest(unittest.TestCase):
         output = parent / "capture"
         config = replace(
             build_capture_config(
-                mode="camera-imu" if include_imu else "stereo-continuous",
+                mode="stereo-imu" if include_imu else "stereo-continuous",
                 output=str(output),
                 overrides={
                     "image_format": image_format,

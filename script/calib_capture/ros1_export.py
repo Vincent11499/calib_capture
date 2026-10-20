@@ -11,6 +11,7 @@ from typing import Any, Iterable, Iterator
 from .image_io import read_mono8_image
 from .config import DATASET_SCHEMA_VERSION
 from .validator import validate_dataset
+from .modes import is_stereo_imu_mode, is_usb_mode
 
 
 IMAGE_MSGTYPE = "sensor_msgs/msg/Image"
@@ -270,7 +271,10 @@ def export_ros1_bag(
             + "; ".join(validation.errors)
         )
     config = session.get("config", {})
-    include_imu = str(config.get("mode", session.get("mode", ""))) == "camera-imu"
+    mode = str(config.get("mode", session.get("mode", "")))
+    if is_usb_mode(mode):
+        raise ValueError("ROS1 export currently supports stereo datasets only, not single-camera USB data")
+    include_imu = is_stereo_imu_mode(mode)
     topics = {
         "cam0": left_topic or str(config.get("left_topic", "/stereo/left/image_raw")),
         "cam1": right_topic or str(config.get("right_topic", "/stereo/right/image_raw")),

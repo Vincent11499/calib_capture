@@ -1,4 +1,4 @@
-# AXERA VIN 标定接口、vis 映射与 ABI 约束
+# AXERA VIN／IVPS 采集接口、vis 映射与 ABI 约束
 
 ## 权威 SDK
 
@@ -35,7 +35,20 @@ ctypes 的独立 `AX_VIDEO_FRAME_T` 与完整 `AX_IMG_INFO_T` 都带 512 字节�
 分辨率：跟随相机 config，脚本只核验 3840x2160 或 1920x1080
 ```
 
-vis 模式另有两套已确认输出：VIN 仍为左 pipe 2、右 pipe 0、chn 0、NV12 3840×2160；IVPS 为左 grp 7、右 grp 8、chn 0、灰度 640×384。它们仅作为文档中的接线参考，标定录制命令只读取上述全分辨率 VIN 路径。
+vis 模式另有两套已确认输出：VIN 仍为左 pipe 2、右 pipe 0、chn 0、NV12 3840×2160；IVPS 为左 grp 7、右 grp 8、chn 0、灰度 640×384。它们仅作为接线参考，不用于双目标定命令。
+
+USB 单相机命令固定读取：
+
+```text
+AX_IVPS_GetChnFrame(grp=3, chn=0, ...)
+分辨率：固定校验 1920x1080
+输出：支持的未压缩 YUV/RGB 提取为 mono8，不缩放
+```
+
+USB 路径加载现有 `libax_sys.so`、`libax_ivps.so`，只附着消费者上下文，不调用
+IVPS 创建、启停或通道配置接口。每个成功帧按物理地址映射、缓存失效、复制到 Python
+缓冲、Munmap，最后把同一个 `AX_VIDEO_FRAME_T` 交回 grp 3/chn 0 的
+`AX_IVPS_ReleaseChnFrame`，严格释放一次。编码线程不持有 SDK 帧或映射。
 
 `AX_SYS_Init` 和 `AX_VIN_Init` 只附着当前 Python 进程的 SDK/VB/VIN 消费者上下文。脚本不会创建、启动、停止或重新配置 VIN/IVPS pipe/group/channel。板端应设置 `BSP_MSP_DIR=/soc/lib` 和 `LD_LIBRARY_PATH=/soc/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}`；后者用于解析 `libax_proton.so` 的传递依赖。脚本同时先以全局符号方式加载 `libax_sys.so`；若同目录存在，则依次预加载 `libax_interpreter.so`、`libax_engine.so`，最后加载导出 VIN 接口的 `libax_proton.so`，作为环境遗漏时的容错。
 

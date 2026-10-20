@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from calib_capture.axera import AX_FORMAT_YUV420_SEMIPLANAR, GrayPair
+from calib_capture.base_link import BASE_LINK_POSES
 from calib_capture.cli import _capture_config, build_parser
 from calib_capture.config import build_capture_config
 from calib_capture.dataset import DatasetWriter, ImuRecord
@@ -61,25 +62,25 @@ class DatasetContractTests(unittest.TestCase):
     def write_json(path: Path, value: dict) -> None:
         path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    def config(self, output: Path, mode: str = "camera-imu", **overrides):
+    def config(self, output: Path, mode: str = "stereo-imu", **overrides):
         values = {"imu_preroll_s": 0, "imu_postroll_s": 0, **overrides}
         config = build_capture_config(mode=mode, output=str(output), overrides=values)
         return replace(config, width=5, height=3)
 
     def dataset(
-        self, *, mode: str = "camera-imu", camera_start: int = 2_000_000_000,
+        self, *, mode: str = "stereo-imu", camera_start: int = 2_000_000_000,
         imu_first: int | None = None, imu_last: int | None = None,
         frame_id: str = "sensor_imu", delta_ns: int = 1_000, **overrides,
     ) -> Path:
         self.fixture_number += 1
         output = self.root / f"dataset_{self.fixture_number}"
         config = self.config(output, mode, **overrides)
-        writer = DatasetWriter(output, config, include_imu=mode == "camera-imu")
+        writer = DatasetWriter(output, config, include_imu=mode == "stereo-imu")
         self.addCleanup(writer._close_streams)
         for index in range(2):
             writer.write_pair(pair_record(camera_start + index * 200_000_000, index, delta_ns))
         stats = {}
-        if mode == "camera-imu":
+        if mode == "stereo-imu":
             first = camera_start - 100_000_000 if imu_first is None else imu_first
             last = camera_start + 300_000_000 if imu_last is None else imu_last
             timestamps = list(range(first, last, 10_000_000)) + [last]
@@ -462,8 +463,49 @@ class DatasetContractTests(unittest.TestCase):
                 self.assertFalse((path / "meta/imu_full.jsonl").exists())
                 self.assertTrue((path / "meta/validation.json").is_file())
 
+    def test_base_link_mode_uses_fixed_pose_filenames_and_real_timestamps(self) -> None:
+        output = self.root / "base_link"
+        config = self.config(
+            output,
+            "stereo-baselink-triggered",
+            poses=len(BASE_LINK_POSES),
+        )
+        writer = DatasetWriter(output, config, include_imu=False)
+        self.addCleanup(writer._close_streams)
+        for index, pose_name in enumerate(BASE_LINK_POSES):
+            timestamp = 2_000_000_000 + index * 200_000_000
+            writer.write_pair(
+                pair_record(timestamp, index), filename_stem=pose_name
+            )
+        writer.seal_payload({
+            "capture_status": "completed",
+            "mode": "stereo-baselink-triggered",
+            "capture_stats": {},
+        })
+        path = writer.commit(True)
+        report = self.assert_valid(path)
+        self.assertEqual(report.stats["cam0_count"], len(BASE_LINK_POSES))
+        for camera in ("cam0", "cam1"):
+            rows = (path / "cameras" / camera / "timestamps.csv").read_text(
+                encoding="utf-8"
+            ).splitlines()[1:]
+            self.assertEqual(
+                [row.split(",", 1)[1] for row in rows],
+                [pose + ".bmp" for pose in BASE_LINK_POSES],
+            )
+            expected_first = "2000000000," if camera == "cam0" else "2000001000,"
+            self.assertTrue(rows[0].startswith(expected_first))
+
+    def test_pose_filename_stem_must_be_safe(self) -> None:
+        output = self.root / "unsafe_pose"
+        config = self.config(output, "stereo-triggered", poses=1)
+        writer = DatasetWriter(output, config, include_imu=False)
+        self.addCleanup(writer._close_streams)
+        with self.assertRaisesRegex(ValueError, "unsafe image filename stem"):
+            writer.write_pair(pair_record(2_000_000_000, 0), filename_stem="../pose")
+
     def test_previous_dual_csv_layout_is_rejected(self) -> None:
-        for mode in ("stereo-continuous", "camera-imu"):
+        for mode in ("stereo-continuous", "stereo-imu"):
             with self.subTest(mode=mode):
                 path = self.dataset(mode=mode)
                 make_v190_fixture(path)
@@ -488,36 +530,36 @@ class DatasetContractTests(unittest.TestCase):
         self.assert_invalid(path)
 
     def test_roll_config_defaults_and_finite_nonnegative_range(self) -> None:
-        config = build_capture_config(mode="camera-imu")
+        config = build_capture_config(mode="stereo-imu")
         self.assertEqual(config.imu_preroll_s, 1.0)
         self.assertEqual(config.imu_postroll_s, 1.0)
         for key in ("imu_preroll_s", "imu_postroll_s"):
             for value in (0, 0.25, 6, "1.5"):
                 with self.subTest(key=key, accepted=value):
-                    configured = build_capture_config(mode="camera-imu", overrides={key: value})
+                    configured = build_capture_config(mode="stereo-imu", overrides={key: value})
                     self.assertEqual(getattr(configured, key), float(value))
             for value in (-1, "NaN", "Infinity", "-Infinity", "not-a-number"):
                 with self.subTest(key=key, rejected=value):
                     with self.assertRaises(ValueError):
-                        build_capture_config(mode="camera-imu", overrides={key: value})
+                        build_capture_config(mode="stereo-imu", overrides={key: value})
 
     def test_roll_ini_and_cli_obey_precedence_without_changing_image_duration(self) -> None:
         ini = self.root / "capture.ini"
         ini.write_text("[capture]\nschema_version = 1.0.0\nimu_preroll_s = 2.5\nimu_postroll_s = 3\n", encoding="utf-8")
         parser = build_parser()
-        args = parser.parse_args(["--config", str(ini), "camera-imu", "--imu-preroll-s", "0"])
-        config = _capture_config(args, "camera-imu")
+        args = parser.parse_args(["--config", str(ini), "stereo-imu", "--imu-preroll-s", "0"])
+        config = _capture_config(args, "stereo-imu")
         self.assertEqual(config.imu_preroll_s, 0.0)
         self.assertEqual(config.imu_postroll_s, 3.0)
         self.assertEqual(config.duration_s, 60.0)
-        args = parser.parse_args(["camera-imu", "--imu-preroll-s", "1.5", "--imu-postroll-s", "0"])
-        config = _capture_config(args, "camera-imu")
+        args = parser.parse_args(["stereo-imu", "--imu-preroll-s", "1.5", "--imu-postroll-s", "0"])
+        config = _capture_config(args, "stereo-imu")
         self.assertEqual(config.imu_preroll_s, 1.5)
         self.assertEqual(config.imu_postroll_s, 0.0)
         for key in ("imu_preroll_s", "imu_postroll_s"):
             ini.write_text(f"[capture]\nschema_version = 1.0.0\n{key} = nan\n", encoding="utf-8")
             with self.assertRaises(ValueError):
-                build_capture_config(mode="camera-imu", config_path=str(ini))
+                build_capture_config(mode="stereo-imu", config_path=str(ini))
 
     def test_roll_cli_options_apply_only_to_camera_imu(self) -> None:
         parser = build_parser()

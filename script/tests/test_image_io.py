@@ -24,7 +24,7 @@ class ImageConfigTests(unittest.TestCase):
             path = Path(raw) / "capture.ini"
             path.write_text("[capture]\nschema_version = 1.0.0\nimage_format = jpeg\njpeg_quality = 90\n", encoding="utf-8")
             args = build_parser().parse_args([
-                "--config", str(path), "camera-imu", "--jpeg-quality", "95"])
+                "--config", str(path), "stereo-imu", "--jpeg-quality", "95"])
             config = _capture_config(args, args.command)
             self.assertEqual((config.image_format, config.jpeg_quality), ("jpeg", 95))
             self.assertEqual(config.save_rate_hz, 5)
@@ -33,12 +33,12 @@ class ImageConfigTests(unittest.TestCase):
     def test_bad_format_and_quality_rejected(self):
         for options in ({"image_format": "png"}, {"jpeg_quality": 0}, {"jpeg_quality": 101}):
             with self.subTest(options=options), self.assertRaises(ValueError):
-                build_capture_config(mode="camera-imu", overrides=options)
+                build_capture_config(mode="stereo-imu", overrides=options)
 
     def test_missing_jpeg_codec_fails_before_creating_dataset(self):
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "dataset"
-            config = build_capture_config(mode="camera-imu", overrides={"image_format": "jpeg"})
+            config = build_capture_config(mode="stereo-imu", overrides={"image_format": "jpeg"})
             with mock.patch("calib_capture.image_io._jpeg_modules", side_effect=RuntimeError("missing OpenCV")):
                 with self.assertRaisesRegex(RuntimeError, "OpenCV"):
                     DatasetWriter(path, config, True)

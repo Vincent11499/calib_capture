@@ -116,7 +116,7 @@ def run_self_test(sdk_include_dir: str = "") -> dict[str, Any]:
 
         output = temp / "dataset"
         config = build_capture_config(
-            mode="camera-imu",
+            mode="stereo-imu",
             output=str(output),
             overrides={"resolution": "1920x1080", "save_rate_hz": 10.0,
                        "imu_preroll_s": 0, "imu_postroll_s": 0},
@@ -157,7 +157,7 @@ def run_self_test(sdk_include_dir: str = "") -> dict[str, Any]:
             )
         session = dataset.seal_payload(
             {
-                "mode": "camera-imu",
+                "mode": "stereo-imu",
                 "capture_status": "completed",
                 "capture_stats": {
                     "startup_camera_timestamp_ns": 1_000_000_000,

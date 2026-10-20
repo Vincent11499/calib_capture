@@ -17,6 +17,7 @@ from .axera import (
     assert_ctypes_abi,
 )
 from .bmp import BMP_PIXEL_OFFSET
+from .base_link import BASE_LINK_POSES
 from .config import CaptureConfig, NS_PER_SECOND, DATASET_SCHEMA_VERSION
 from .dataset import DatasetWriter, ImuRecord, utc_now_text
 from .validator import ValidationReport, validate_dataset
@@ -140,10 +141,12 @@ class ImuSubscriber:
         config: CaptureConfig,
         callback: Callable[[ImuRecord], bool | None] | None = None,
         *, temperature_callback: Callable[[Any], None] | None = None,
+        allow_non_increasing_timestamps: bool = False,
     ) -> None:
         self.config = config
         self.callback = callback
         self.temperature_callback = temperature_callback
+        self.allow_non_increasing_timestamps = allow_non_increasing_timestamps
         self.records: list[ImuRecord] = []
         self.count = 0
         self.first_timestamp_ns: int | None = None
@@ -237,8 +240,19 @@ class ImuSubscriber:
                     )
                     if record.timestamp_ns <= 0:
                         raise ValueError("IMU header timestamp is zero or negative")
-                    if owner.last_timestamp_ns is not None and record.timestamp_ns <= owner.last_timestamp_ns:
-                        raise ValueError("IMU header timestamp is not strictly increasing")
+                    if (
+                        not owner.allow_non_increasing_timestamps
+                        and owner.last_timestamp_ns is not None
+                        and record.timestamp_ns <= owner.last_timestamp_ns
+                    ):
+                        delta_ns = record.timestamp_ns - owner.last_timestamp_ns
+                        raise ValueError(
+                            "IMU header timestamp is not strictly increasing: "
+                            f"previous={owner.last_timestamp_ns}, current={record.timestamp_ns}, "
+                            f"delta_ns={delta_ns}, accepted_count={owner.count}, "
+                            f"angular_velocity={record.angular_velocity}, "
+                            f"linear_acceleration={record.linear_acceleration}"
+                        )
                     if owner.callback is not None:
                         if owner.callback(record) is False:
                             return  # IMU-only warmup: no temperature received yet.
@@ -712,9 +726,12 @@ def record_triggered(
     config: CaptureConfig,
     *,
     input_function: Callable[[str], str] = input,
+    pose_names: tuple[str, ...] | None = None,
 ) -> tuple[Path, ValidationReport]:
     if not config.output:
         raise ValueError("--output is required")
+    if pose_names is not None and len(pose_names) != config.poses:
+        raise ValueError("pose name count must match configured pose count")
     print(
         f"Uncompressed stereo BMP equivalent for {config.poses} poses: "
         f"{_estimated_stereo_gb(config, config.poses):.2f} GB. "
@@ -743,9 +760,18 @@ def record_triggered(
         )
         buffers = (bytearray(config.width * config.height), bytearray(config.width * config.height))
         for pose_index in range(1, config.poses + 1):
-            command = input_function(
+            pose_name = pose_names[pose_index - 1] if pose_names is not None else None
+            prompt = (
+                "\n"
+                "============================================================\n"
+                f"[{pose_index}/{config.poses}] 请调整到以下姿态 / TARGET POSE\n"
+                f">>>                 {pose_name}                 <<<\n"
+                "============================================================\n"
+                "调整完成后按 Enter 保存（输入 q 退出）: "
+                if pose_name is not None else
                 f"[{pose_index}/{config.poses}] Place target, press Enter to save (q abort): "
-            ).strip().lower()
+            )
+            command = input_function(prompt).strip().lower()
             if command in {"q", "quit", "exit"}:
                 raise UserAbort(
                     f"operator aborted after {dataset.pair_count}/{config.poses} stereo pairs"
@@ -758,9 +784,11 @@ def record_triggered(
             finally:
                 if not frames.released:
                     grabber.release_frames(frames)
-            dataset.write_pair(pair)
+            dataset.write_pair(pair, filename_stem=pose_name)
             print(
-                f"  saved pair {pose_index}: L={pair.left_timestamp_ns}, "
+                f"  saved pair {pose_index}"
+                f"{f' ({pose_name})' if pose_name is not None else ''}: "
+                f"L={pair.left_timestamp_ns}, "
                 f"R={pair.right_timestamp_ns}, delta={pair.delta_us:.3f} us"
             )
         deinit_result = api.close()
@@ -794,6 +822,15 @@ def record_triggered(
             _capture_session(config, api, grabber, warmup, stats, deinit_result, failed=True),
         )
         raise CaptureFailed(f"capture failed; data kept at {failed_path}: {exc}") from exc
+
+
+def record_base_link_triggered(
+    config: CaptureConfig,
+    *,
+    input_function: Callable[[str], str] = input,
+) -> tuple[Path, ValidationReport]:
+    """Capture the fixed 14-pose stereo sequence used for base_link calibration."""
+    return record_triggered(config, input_function=input_function, pose_names=BASE_LINK_POSES)
 
 
 def probe_hardware(

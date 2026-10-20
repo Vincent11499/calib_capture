@@ -214,7 +214,7 @@ class SubscriberTests(unittest.TestCase):
                 ReliabilityPolicy=SimpleNamespace(BEST_EFFORT=1), QoSProfile=mock.Mock()),
             "sensor_msgs": mock.Mock(), "sensor_msgs.msg": SimpleNamespace(Imu=object),
         }
-        subscriber = ImuSubscriber(build_capture_config(mode="camera-imu"))
+        subscriber = ImuSubscriber(build_capture_config(mode="stereo-imu"))
         with mock.patch.dict(sys.modules, modules), mock.patch.object(capture.threading, "Thread"):
             subscriber.start()
             for index, frame_id in enumerate(("imu_link", ""), 1):
@@ -231,12 +231,79 @@ class SubscriberTests(unittest.TestCase):
         rclpy.init.assert_called_once_with(args=[], signal_handler_options=no_handlers)
 
     def test_wait_first_allows_cancellation_without_timeout_delay(self):
-        subscriber = ImuSubscriber(build_capture_config(mode="camera-imu"))
+        subscriber = ImuSubscriber(build_capture_config(mode="stereo-imu"))
         with self.assertRaisesRegex(UserAbort, "startup stopped"):
             subscriber.wait_first(15, mock.Mock(side_effect=UserAbort("startup stopped")))
 
+    def test_non_increasing_timestamp_error_contains_diagnostics(self):
+        rclpy = mock.Mock()
+
+        class Node:
+            def __init__(self, name):
+                pass
+
+            def create_subscription(self, *args):
+                return object()
+
+        modules = {
+            "rclpy": rclpy,
+            "rclpy.node": SimpleNamespace(Node=Node),
+            "rclpy.signals": SimpleNamespace(
+                SignalHandlerOptions=SimpleNamespace(NO=object())
+            ),
+            "rclpy.qos": SimpleNamespace(
+                DurabilityPolicy=SimpleNamespace(VOLATILE=1),
+                HistoryPolicy=SimpleNamespace(KEEP_LAST=1),
+                ReliabilityPolicy=SimpleNamespace(BEST_EFFORT=1),
+                QoSProfile=mock.Mock(),
+            ),
+            "sensor_msgs": mock.Mock(),
+            "sensor_msgs.msg": SimpleNamespace(Imu=object),
+        }
+        subscriber = ImuSubscriber(build_capture_config(mode="stereo-imu"))
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(capture.threading, "Thread"):
+            subscriber.start()
+            vector = SimpleNamespace(x=1.0, y=2.0, z=3.0, w=1.0)
+
+            def message(nanosec):
+                return SimpleNamespace(
+                    header=SimpleNamespace(
+                        stamp=SimpleNamespace(sec=4, nanosec=nanosec),
+                        frame_id="imu_link",
+                    ),
+                    orientation=vector,
+                    orientation_covariance=(0,) * 9,
+                    angular_velocity=vector,
+                    angular_velocity_covariance=(0,) * 9,
+                    linear_acceleration=vector,
+                    linear_acceleration_covariance=(0,) * 9,
+                )
+
+            subscriber._node.on_imu(message(20))
+            subscriber._node.on_imu(message(10))
+
+            retained = []
+            relaxed = ImuSubscriber(
+                build_capture_config(mode="imu-continuous"),
+                retained.append,
+                allow_non_increasing_timestamps=True,
+            )
+            relaxed.start()
+            relaxed._node.on_imu(message(20))
+            relaxed._node.on_imu(message(10))
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"previous=4000000020, current=4000000010, delta_ns=-10, "
+            r"accepted_count=1.*angular_velocity=\(1\.0, 2\.0, 3\.0\)",
+        ):
+            subscriber.raise_if_failed()
+        self.assertIsNone(relaxed.error)
+        self.assertEqual([record.timestamp_ns for record in retained],
+                         [4_000_000_020, 4_000_000_010])
+
     def test_unexpected_ros_shutdown_is_an_error(self):
-        subscriber = ImuSubscriber(build_capture_config(mode="camera-imu"))
+        subscriber = ImuSubscriber(build_capture_config(mode="stereo-imu"))
         subscriber._node = object()
         subscriber._rclpy = SimpleNamespace(ok=lambda: False)
         subscriber._spin()
@@ -295,7 +362,7 @@ class CaptureFlowTests(unittest.TestCase):
         interrupts = _CaptureInterrupts()
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        built = build_capture_config(mode="camera-imu", overrides={
+        built = build_capture_config(mode="stereo-imu", overrides={
             "duration_s": 0.6, "imu_preroll_s": 1.0, "imu_postroll_s": 1.0,
             "startup_timeout_s": 0.3,
         })

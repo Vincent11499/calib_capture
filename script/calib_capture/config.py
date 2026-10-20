@@ -9,6 +9,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from .modes import (
+    STEREO_BASELINK_MODE,
+    STEREO_IMU_MODE,
+    USB_BASELINK_MODE,
+    USB_CONTINUOUS_MODE,
+    is_stereo_imu_mode,
+    is_usb_mode,
+)
+
 
 APP_VERSION = "1.0.0"
 DATASET_SCHEMA_VERSION = APP_VERSION
@@ -17,6 +26,9 @@ KALIBR_MANIFEST_MARKER = "kalibr_directory_dataset"
 CAPTURE_LAYOUT = "compact"
 NS_PER_SECOND = 1_000_000_000
 SESSION_DIRECTORY_FORMAT = "%y%m%d_%H%M"
+USB_IVPS_GRP = 3
+USB_IVPS_CHN = 0
+USB_RESOLUTION = (1920, 1080)
 
 AUTHORITATIVE_SDK_INCLUDE = Path(
     r"D:\tool\mipi_tools\sensor_timing_check_tool\bsp_sdk\include"
@@ -59,6 +71,7 @@ DEFAULTS: dict[str, Any] = {
     "startup_timeout_s": 15.0,
     "imu_topic": "/imu/data",
     "imu_temperature_topic": "/imu/temperature",
+    "use_temperature": True,
     "imu_expected_rate_hz": 100.0,
     "imu_qos_depth": 2000,
     "imu_preroll_s": 1.0,
@@ -195,6 +208,7 @@ class CaptureConfig:
     startup_timeout_s: float
     imu_topic: str
     imu_temperature_topic: str
+    use_temperature: bool
     imu_expected_rate_hz: float
     imu_qos_depth: int
     imu_preroll_s: float
@@ -261,11 +275,22 @@ def build_capture_config(
     if values["schema_version"] != APP_VERSION:
         raise ValueError(f"schema_version must be {APP_VERSION}")
     if not values["dataset_name"]:
-        values["dataset_name"] = {"camera-imu": "stereo_imu", "imu-continuous": "imu",
-                                  "stereo-raw-triggered": "stereo_raw"}.get(mode, "stereo")
+        values["dataset_name"] = {
+            STEREO_IMU_MODE: "stereo_imu",
+            "imu-continuous": "imu",
+            "stereo-raw-triggered": "stereo_raw",
+            STEREO_BASELINK_MODE: "stereo_base_link",
+            USB_CONTINUOUS_MODE: "usb",
+            USB_BASELINK_MODE: "usb_baselink",
+        }.get(mode, "stereo")
     validate_dataset_name(values["dataset_name"])
 
     width, height = parse_resolution(str(values.pop("resolution")))
+    if is_usb_mode(mode):
+        width, height = USB_RESOLUTION
+        # USB IVPS capture is intentionally controlled only by PTS rate.  An
+        # unrelated stereo frame_divisor in a shared INI must not change it.
+        values["frame_divisor"] = 0
     values["image_format"] = str(values["image_format"]).lower()
     if values["image_format"] not in {"bmp", "jpeg"}:
         raise ValueError("image_format must be bmp or jpeg")
@@ -276,6 +301,11 @@ def build_capture_config(
     if not 1 <= values["image_workers"] <= 8:
         raise ValueError("image_workers must be between 1 and 8")
     values["sdk_include_dir"] = detect_sdk_include_dir(str(values["sdk_include_dir"]))
+
+    boolean_text = str(values["use_temperature"]).strip().lower()
+    if boolean_text not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        raise ValueError("use_temperature must be true or false")
+    values["use_temperature"] = boolean_text in {"1", "true", "yes", "on"}
 
     integer_nonnegative = ("left_pipe", "left_chn", "right_pipe", "right_chn")
     for key in integer_nonnegative:
@@ -334,13 +364,13 @@ def build_capture_config(
         raise ValueError("camera and IMU topic names must not be empty")
     if values["left_topic"] == values["right_topic"]:
         raise ValueError("left and right camera topics must be different")
-    if mode == "camera-imu" and values["imu_topic"] in {
+    if is_stereo_imu_mode(mode) and values["imu_topic"] in {
         values["left_topic"],
         values["right_topic"],
     }:
         raise ValueError("IMU and camera topics must be different")
 
-    if mode == "imu-continuous" and (
+    if mode == "imu-continuous" and values["use_temperature"] and (
         not values["imu_temperature_topic"] or values["imu_temperature_topic"] == values["imu_topic"]
     ):
         raise ValueError("IMU temperature topic must be nonempty and different from IMU topic")

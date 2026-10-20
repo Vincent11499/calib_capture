@@ -16,23 +16,30 @@ RAW 接受 Bayer RAW(0x80..0x87) + NONE(0) 或 LOSSLESS(1)。每帧记录 `compr
 
 会话名称为 `<dataset_name>_YYMMDD_hhmm`，例如 `evt31_260909_1517`。日期来自运行设备本地时间，只用于命名，不能当作传感器时间。session 另外记录 UTC 创建与封存时间。
 
-`--output` 是输出根目录，默认 `./data`；`dataset_name` 可由 INI 或 CLI 显式指定，默认双目 `stereo`、Camera–IMU `stereo_imu`、独立 IMU `imu`。前缀范围为 1–64 个 ASCII 字母、数字、下划线、连字符，首字符是字母或数字；空 INI 值表示模式默认。相同前缀一分钟内重复启动报错，正式目录及 `.inprogress`、`.failed` 均不覆盖。
+`--output` 是输出根目录，默认 `./data`；`dataset_name` 可由 INI 或 CLI 显式指定，默认普通双目 `stereo`、base_link 固定姿态双目 `stereo_base_link`、Stereo–IMU `stereo_imu`、USB 连续 `usb`、USB 固定姿态 `usb_baselink`、独立 IMU `imu`。前缀范围为 1–64 个 ASCII 字母、数字、下划线、连字符，首字符是字母或数字；空 INI 值表示模式默认。相同前缀一分钟内重复启动报错，正式目录及 `.inprogress`、`.failed` 均不覆盖。
 
 ```text
 dataset.yaml
 cameras/cam0/timestamps.csv
-cameras/cam0/<timestamp_ns>.bmp 或 .jpg
+cameras/cam0/<timestamp_ns 或 pose_name>.bmp 或 .jpg
 cameras/cam1/timestamps.csv
-cameras/cam1/<timestamp_ns>.bmp 或 .jpg
-imu/imu0.csv                  # 仅 camera-imu
+cameras/cam1/<timestamp_ns 或 pose_name>.bmp 或 .jpg
+imu/imu0.csv                  # 仅 stereo-imu
 meta/capture_dataset.yaml
 meta/pairs.csv
-meta/imu_full.jsonl            # 仅 camera-imu
+meta/imu_full.jsonl            # 仅 stereo-imu
 meta/session.json
 meta/validation.json
 ```
 
 纯双目不创建 IMU 文件；Camera–IMU 只保存一份 IMU CSV。采集器只写灰度 BMP 或 JPG；Kalibr reader 也支持 PNG、JPEG/JPG、BMP。所有 manifest 路径相对数据集根目录，图像 CSV 文件名相对该相机 images 目录，不允许越界。
+
+USB 两个命令是单相机布局，只创建 `cameras/cam0/` 和
+`meta/frames.csv`，不创建 `cam1`、`pairs.csv` 或 IMU 目录。`frames.csv` 为
+`frame_index,timestamp_ns,sequence,source_format`。根 manifest 的 `cameras`
+只有 `cam0`；来源固定为 `AX_IVPS_GetChnFrame` grp 3/chn 0、1920×1080。
+`usb-baselink-triggered` 的文件名使用相同 14 个姿态名，真实 PTS 仍写在
+`timestamps.csv`。
 
 ## 公共 manifest
 
@@ -73,8 +80,8 @@ imus:
 
 ## 相机、IMU 和配对
 
-- cam0 恒为左目，cam1 恒为右目；默认 VIN 分别是 pipe 2/chn 0、pipe 0/chn 0。单目标定可以直接选择一个相机，不需要另存图像。
-- `timestamps.csv` 严格为 `timestamp_ns,filename`；例如 `63359465332000,63359465332000.bmp`。
+- 双目数据中 cam0 恒为左目、cam1 恒为右目；默认 VIN 分别是 pipe 2/chn 0、pipe 0/chn 0。USB 单相机数据只有 cam0，来源为 IVPS grp 3/chn 0，不代表双目左目。
+- `timestamps.csv` 严格为 `timestamp_ns,filename`。普通模式例如 `63359465332000,63359465332000.bmp`；`stereo-baselink-triggered` 使用固定姿态文件名，例如 `63359465332000,43_0_0.bmp`，左右真实时间戳仍各自保留在第一列。
 - 相机各自保存 `u64PTS × 1000` 纳秒，`clock_source: axera_pts_us` 说明硬件源单位是微秒，CSV 始终是纳秒。IMU 保留 ROS 原始 header stamp；所有时间戳必须为 `[0, 2^63-1]` 范围内整数且各流严格递增。
 - `imu/imu0.csv` 严格为 `timestamp_ns,wx,wy,wz,ax,ay,az`；角速度 rad/s，加速度 m/s²。不交换轴、不变号、不缩放、不因图像限频裁剪 IMU。
 - `meta/pairs.csv` 为 `pair_index,left_timestamp_ns,right_timestamp_ns,left_sequence,right_sequence,delta_us,left_format,right_format`。保留两侧原始时间戳，不写平均时间。
@@ -119,11 +126,11 @@ Allan 可用 `--start-s/--end-s` 选择相对第一条 IMU 的秒数区间 `[sta
 
 离线 `allan` 读取下面的独立 IMU 会话，默认将分析结果写入项目根目录下 `data/allan_variance/allantools_output/<输入目录名>/`，可用 `--output` 覆盖，不修改原始数据。输出 `analysis.json` 使用 `schema_version: "1.0.0"`、`kind: imu_allan_analysis`，记录源路径、计算方法、采样间隔统计、实际使用频率、温度摘要与警告；不拟合噪声参数。六轴 `allan_<轴名>.csv` 表头为 `tau_s,adev,avar,adev_error,n`，另有标准差及方差两张 PNG 曲线图；这些 PNG 是离线图表，不是相机采集格式。非均匀采样仅在显式允许时近似计算并告警，原始零值保留。
 
-独立 IMU CSV 现为八列 `timestamp_ns,wx,wy,wz,ax,ay,az,temperature`，仅此模式新增温度；Camera–IMU 的七列契约不变。默认同时订阅 `/imu/data`（约 100 Hz）和 `/imu/temperature`（sensor_msgs/msg/Temperature，约 1 Hz）。每条 IMU 附带最新收到的摄氏温度，不插值、不按温度 header.stamp 排序或匹配，原 IMU 时间戳保持不变。variance 不保存，NaN variance 不影响记录；温度值本身非有限则失败。
+独立 IMU CSV 默认八列 `timestamp_ns,wx,wy,wz,ax,ay,az,temperature`，仅此模式新增温度；Camera–IMU 的七列契约不变。默认同时订阅 `/imu/data`（约 100 Hz）和 `/imu/temperature`（sensor_msgs/msg/Temperature，约 1 Hz）。每条 IMU 附带最新收到的摄氏温度，不插值、不按温度 header.stamp 排序或匹配，原 IMU 时间戳保持不变。variance 不保存，NaN variance 不影响记录；温度值本身非有限则失败。设备没有温度话题时可用 `--ignore-temperature`，此时不订阅或等待温度，独立 IMU CSV 使用七列 `timestamp_ns,wx,wy,wz,ax,ay,az`，且 session 的 `temperature.enabled` 为 `false`。
 
 启动先等到温度，再保存后续 IMU 并开始计时；之前的 IMU 为预热跳过，不缓存或倒填未来温度。缺温度/IMU 共用启动超时。温度停止更新时继续沿用旧值，沿用时间超过 2 秒只告警。session.temperature 记录话题、类型、单位、更新数、最大沿用秒数和预热跳过数。校验要求新增八列和温度 metadata，不自动修改旧七列独立采集文件。
 
-`imu-continuous` 用于后续 Allan 分析，不调用相机 SDK。只输出一份 `imu/imu0.csv`、`meta/session.json` 和 `meta/validation.json`，无双目 manifest、图像或 JSONL；session kind 为 `imu_capture_session`，layout 为 `imu_allan_csv`，版本仍为 `1.0.0`。逐行处理，不因时长无限缓存；原始单位不变。至少需要两条递增有限样本，停流／坐标系变化失败。
+`imu-continuous` 用于原始 IMU 诊断采集，不调用相机 SDK。输出 `imu/imu0.csv`、`meta/imu_timestamp_anomalies.jsonl`、`meta/session.json` 和 `meta/validation.json`，无双目 manifest、图像或完整消息 JSONL；session kind 为 `imu_capture_session`，layout 为 `imu_allan_csv`，版本仍为 `1.0.0`。逐行处理，不因时长无限缓存；原始单位、header stamp 和回调到达顺序不变。时间戳重复或回退时继续保存 CSV，并把相邻异常记录写入 JSONL；`session.timestamp_quality` 和 validation 记录重复数、回退数及最大回退量。含这类警告的数据不能直接用于 Allan/Kalibr，必须先定位上游数据源；分析工具仍要求严格递增。至少需要两条有限样本，非正/越界时间戳、停流或坐标系变化失败。
 
 可选 ROS1 `imu_utils` 交叉分析只读取八列 `imu/imu0.csv`，不要求输入元数据，构造只用于回放的派生 bag，但该
 文件不是本项目 `export-ros1` 的正式输出，也不属于 v1.0.0 数据集。原会话必须只读；

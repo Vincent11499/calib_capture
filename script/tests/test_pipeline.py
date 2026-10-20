@@ -20,7 +20,7 @@ from test_calibration_data import make_frame, make_grabber, make_pair, FakeVinAp
 
 
 def small_writer(root, workers=2):
-    config = build_capture_config(mode="camera-imu", overrides={"image_workers": workers})
+    config = build_capture_config(mode="stereo-imu", overrides={"image_workers": workers})
     return DatasetWriter(Path(root)/"dataset", replace(config, width=5, height=3), True)
 
 
@@ -79,13 +79,13 @@ class BufferTests(unittest.TestCase):
 
 class PipelineTests(unittest.TestCase):
     def test_workers_ini_cli_and_range(self):
-        self.assertEqual(build_capture_config(mode="camera-imu").image_workers,2)
+        self.assertEqual(build_capture_config(mode="stereo-imu").image_workers,2)
         with tempfile.TemporaryDirectory() as root:
             path=Path(root)/"config.ini";path.write_text("[capture]\nschema_version = 1.0.0\nimage_workers=4\n")
-            args=build_parser().parse_args(["--config",str(path),"camera-imu","--image-workers","6"])
+            args=build_parser().parse_args(["--config",str(path),"stereo-imu","--image-workers","6"])
             self.assertEqual(_capture_config(args,args.command).image_workers,6)
         for workers in (0,9):
-            with self.assertRaises(ValueError):build_capture_config(mode="camera-imu",overrides={"image_workers":workers})
+            with self.assertRaises(ValueError):build_capture_config(mode="stereo-imu",overrides={"image_workers":workers})
 
     def test_multiple_pairs_overlap_but_commit_in_order(self):
         with tempfile.TemporaryDirectory() as root:

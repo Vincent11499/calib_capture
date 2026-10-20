@@ -1,12 +1,13 @@
-# PC 端 IMU Allan 分析
+# PC 端 IMU 诊断与 Allan 分析
 
-本文统一说明三套 PC 分析流程：
+本文统一说明 IMU 时域／白噪声诊断和三套 Allan 分析流程：
 
-1. 项目原生 `allan_variance` 分析（命令 `allan`，Python AllanTools）；
-2. ROS1 `ALLAN_VARIANCE_ROS`（程序名 `allan_variance_ros`）；
-3. ROS1 `IMU_UTILS`（程序名 `imu_utils`）。
+1. 项目原生时域与白噪声诊断；
+2. 项目原生 `allan_variance` 分析（命令 `allan`，Python AllanTools）；
+3. ROS1 `ALLAN_VARIANCE_ROS`（程序名 `allan_variance_ros`）；
+4. ROS1 `IMU_UTILS`（程序名 `imu_utils`）。
 
-三者都只读板端 `imu-continuous` 生成的 CSV，不修改原始数据。建议先运行 Python
+这些流程都只读板端 `imu-continuous` 生成的 CSV，不修改原始数据。建议先运行 Python
 AllanTools 快速检查，再让两个 ROS 工具使用同一时间区间、同一个派生 bag 做交叉分析。
 
 ## 1. 输入准备
@@ -35,6 +36,10 @@ data/allan_variance/data/<会话名>/
 ```csv
 timestamp_ns,wx,wy,wz,ax,ay,az,temperature
 ```
+
+没有温度发布时，采集命令加 `--ignore-temperature`，CSV 为七列
+`timestamp_ns,wx,wy,wz,ax,ay,az`。项目内置 `allan` 分析支持这两种格式；无温度输入的报告会标记
+`temperature.available: false`，不会补造温度值。
 
 - 时间戳：整数纳秒，严格递增；
 - 角速度：rad/s；
@@ -69,9 +74,75 @@ ROS 两套工具只要求八列 CSV；Python AllanTools 还会读取会话元数
 时间戳不会归零。区间目录名显示为 `_1h-6h`；非整数小时保留一位小数，但实际选区仍按
 精确纳秒计算。已有输出目录默认拒绝覆盖。
 
-## 3. Python AllanTools
+## 3. 时域与白噪声诊断
 
-### 3.1 环境
+两个脚本接受完整独立 IMU 会话目录，或直接接受 `<会话>/imu/imu0.csv`。它们严格检查
+八列表头、有限数值和递增时间戳；不插值、不重采样，也不修改源文件。PC 环境需要
+NumPy、Matplotlib 和 SciPy，依赖列在 `script/requirements-allan.txt`。
+
+### 3.1 时间戳、六轴和温度
+
+默认分析全段：
+
+```powershell
+python script/analyze_imu_timeseries.py Q:\File\machine_data\kalibr_no_ros\imu_260917_2234
+```
+
+指定相对第一条 IMU 时间戳的 `[start,end)`：
+
+```powershell
+python script/analyze_imu_timeseries.py Q:\File\machine_data\kalibr_no_ros\imu_260917_2234 `
+  --start-s 3600 --end-s 7200
+```
+
+默认输出到源会话同级的 `analysis/<会话名>/timeseries_all/` 或带时间区间的子目录。输出
+`timestamp_intervals.png`、`imu_axes_temperature.png`、`summary.json` 和
+`statistics.csv`。曲线默认最多绘制 20,000 个 min/max 包络点，减少绘图内存并保留孤立
+尖峰；`--max-plot-points` 可调整。时间戳直方图默认沿用时序检查工具的右闭区间：
+`<=7.5 ms`、按 1 ms 递增、`(19.5,20] ms`、`>20 ms`，图中标注每档数量及两端比例；
+`summary.json` 和 `statistics.csv` 同时保存精确数量与比例。分箱可用 `--hist-min-ms`、
+`--hist-max-ms`、`--hist-bin-width-ms` 修改。
+
+min/max 包络会保留每个桶内的最小值和最大值，因此单个孤立异常、正负尖峰和跳变两侧
+通常都能显示。它不会保留同一桶中的每一个异常：多个同向尖峰只显示最极端者，跳变的
+精确时刻最多有一个桶宽的不确定性。完整 280 万点压到 20,000 点时，一个桶约 280 个
+原始样本；定位细节时应缩小 `--start-s/--end-s`，或提高 `--max-plot-points`。
+
+### 3.2 高斯性和白噪声诊断
+
+默认选择完整数据中间的 1,800 秒：
+
+```powershell
+python script/analyze_imu_noise.py Q:\File\machine_data\kalibr_no_ros\imu_260917_2234
+```
+
+也可以选择精确区间：
+
+```powershell
+python script/analyze_imu_noise.py Q:\File\machine_data\kalibr_no_ros\imu_260917_2234 `
+  --start-s 3600 --end-s 5400
+```
+
+仅指定 `--start-s` 时向后取 `--duration-s`，仅指定 `--end-s` 时向前取；同时指定起止时
+不能再显式指定时长。默认结果写入 `analysis/<会话名>/noise_mid_30min/`，包含：
+
+- `noise_distribution.png`：六轴直方图和拟合高斯 PDF；
+- `noise_qq.png`：六轴正态 Q-Q 图；
+- `noise_acf.png`：六轴 ACF、95% 置信线及工程阈值；
+- `noise_psd.png`：六轴 Welch PSD；
+- `noise_report.json`、`axis_verdicts.csv`：完整统计量和逐轴结论。
+
+每轴只减去选区均值，不做线性去趋势或滤波。高斯工程条件为
+`|skew| <= 0.1`、`|excess kurtosis| <= 0.2`、`Q-Q r >= 0.995`；白噪声工程条件为
+前 10 秒 `max |ACF| <= 0.05`。工程条件和显著性检验均通过为 `pass`，只有工程条件通过
+为 `approximate`，工程条件不通过为 `fail`。Welch PSD 和谱平坦度只作辅助判断。
+
+这套结论用于检查所选静止段是否近似高斯白噪声；它不拟合 Kalibr 参数，也不等同于
+IMU 噪声模型或标定验收。已有输出目录不会被覆盖，失败现场保留为 `.failed`。
+
+## 4. Python AllanTools
+
+### 4.1 环境
 
 在 Windows PowerShell 中进入已有 `calib` 环境：
 
@@ -82,7 +153,7 @@ cd Q:\project\kalibr_cedarobo
 
 依赖列在 `script/requirements-allan.txt`。程序不会自动安装依赖。
 
-### 3.2 全段分析
+### 4.2 全段分析
 
 ```powershell
 python script/calibration_data.py allan data/allan_variance/data/imu_260911_1502
@@ -100,7 +171,7 @@ python script/analyze_allan.py data/allan_variance/data/imu_260911_1502
 data/allan_variance/allantools_output/imu_260911_1502/
 ```
 
-### 3.3 指定区间并拟合 Kalibr 候选参数
+### 4.3 指定区间并拟合 Kalibr 候选参数
 
 ```powershell
 python script/calibration_data.py allan data/allan_variance/data/imu_260911_1502 `
@@ -134,7 +205,7 @@ python script/calibration_data.py allan data/allan_variance/data/imu_260911_1502
 如果任一轴缺少可信的 −1/2 或 +1/2 区间，命令不会伪造缺失参数，也不会生成
 `kalibr_imu.yaml`；原因保存在 `analysis.json.noise_fit`。
 
-## 4. ROS 容器准备
+## 5. ROS 容器准备
 
 `allan_variance_ros` 和 `imu_utils` 共用一个长期 ROS1 Noetic 容器。Docker Desktop
 运行后，在 WSL 中执行：
@@ -155,9 +226,9 @@ docker compose ps
 
 两个分析任务共享运行锁，不要在同一容器中同时执行。
 
-## 5. imu_utils
+## 6. imu_utils
 
-### 5.1 一键分析
+### 6.1 一键分析
 
 ```bash
 cd /mnt/q/project/kalibr_cedarobo/script/imu_utils_docker/docker
@@ -199,9 +270,9 @@ data/allan_variance/imu_utils_output/imu_260911_1502_1h-6h/
 完整的容器内手动操作、验证脚本和产物解释见
 [imu_utils 专项说明](docker/IMU_UTILS.md)。
 
-## 6. allan_variance_ros
+## 7. allan_variance_ros
 
-### 6.1 独立一键分析
+### 7.1 独立一键分析
 
 ```bash
 cd /mnt/q/project/kalibr_cedarobo/script/imu_utils_docker/docker
@@ -216,7 +287,7 @@ docker compose exec -T imu-utils bash /scripts/run_allan_variance_ros.sh \
 data/allan_variance/imu_utils_output/imu_260911_1502_1h-6h_allan_variance_ros/
 ```
 
-### 6.2 与 imu_utils 复用同一个 bag
+### 7.2 与 imu_utils 复用同一个 bag
 
 先运行上一节的 `imu_utils`，再执行：
 
@@ -252,7 +323,7 @@ docker compose exec -T imu-utils bash /scripts/run_allan_variance_ros.sh \
 [allan_variance_ros 专项说明](docker/ALLAN_VARIANCE_ROS.md)，算法和拟合细节见
 [源码解读](ALLAN_VARIANCE_ROS_SOURCE.md)。
 
-## 7. 三套结果如何使用
+## 8. 三套结果如何使用
 
 | 工具 | 优点 | 主要限制 |
 | --- | --- | --- |
