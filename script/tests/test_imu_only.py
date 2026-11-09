@@ -29,14 +29,19 @@ class ImuOnlyTests(unittest.TestCase):
 
         def construct(
             config, callback, *, temperature_callback,
-            allow_non_increasing_timestamps=False,
+            timestamp_error_callback=None,
         ):
-            self.assertTrue(allow_non_increasing_timestamps)
             def start():
                 if temperature_callback is not None:
                     temperature_callback(SimpleNamespace(temperature=39.0, variance=float("nan")))
+                previous = None
                 for record in records:
+                    if previous is not None and record.timestamp_ns <= previous.timestamp_ns:
+                        self.assertIsNotNone(timestamp_error_callback)
+                        timestamp_error_callback(previous, record)
+                        raise ValueError("IMU header timestamp is not strictly increasing")
                     callback(record)
+                    previous = record
             subscriber.start.side_effect = start
             if error:
                 subscriber.wait_first.side_effect = RuntimeError(error)
@@ -78,6 +83,17 @@ class ImuOnlyTests(unittest.TestCase):
             self.assertEqual(rows[0], list(imu_only.CSV_FIELDS))
             self.assertEqual(rows[1], ["1000000000", "0.1", "-0.2", "0.3", "1.0", "2.0", "9.8", "39.0"])
             self.assertEqual(report.stats["imu_effective_rate_hz"], 100)
+            self.assertEqual(report.stats["imu_timestamp_anomaly_count"], 0)
+            self.assertEqual(
+                (output / "meta/imu_timestamp_anomalies.jsonl").read_text(encoding="utf-8"),
+                "",
+            )
+            session = json.loads((output / "meta/session.json").read_text())
+            self.assertEqual(session["timestamp_policy"], {
+                "strictly_increasing_required": True,
+                "fatal_anomaly_log": "meta/imu_timestamp_anomalies.jsonl",
+                "fatal_anomaly_count": 0,
+            })
             with mock.patch("builtins.print"):
                 self.assertEqual(main(["validate", str(output)]), 0)
                 self.assertEqual(main(["export-ros1", str(output), str(output / "x.bag")]), 1)
@@ -107,41 +123,39 @@ class ImuOnlyTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.run_capture(Path(raw) / "session", records=[sample(), record])
 
-    def test_timestamp_anomalies_are_retained_and_reported(self):
-        records = [
-            sample(1_000_000_000),
-            sample(1_010_000_000),
-            sample(1_005_000_000),
-            sample(1_005_000_000),
-            sample(1_020_000_000),
-        ]
-        with tempfile.TemporaryDirectory() as raw:
-            output, report = self.run_capture(Path(raw) / "session", records=records)
-            self.assertFalse(report.errors)
-            self.assertEqual(report.stats["imu_timestamp_regression_count"], 1)
-            self.assertEqual(report.stats["imu_timestamp_duplicate_count"], 1)
-            self.assertEqual(report.stats["imu_timestamp_max_regression_ns"], 5_000_000)
-            self.assertTrue(any("all arrival-order rows were retained" in item
-                                for item in report.warnings))
-            with (output / "imu/imu0.csv").open() as stream:
-                rows = list(csv.reader(stream))
-            self.assertEqual([int(row[0]) for row in rows[1:]],
-                             [record.timestamp_ns for record in records])
-            anomalies = [json.loads(line) for line in
-                         (output / "meta/imu_timestamp_anomalies.jsonl")
-                         .read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([item["classification"] for item in anomalies],
-                             ["regression", "duplicate"])
-            self.assertEqual(anomalies[0]["previous"]["timestamp_ns"], 1_010_000_000)
-            self.assertEqual(anomalies[0]["current"]["timestamp_ns"], 1_005_000_000)
-            session = json.loads((output / "meta/session.json").read_text())
-            self.assertEqual(session["timestamp_quality"], {
-                "strictly_increasing": False,
-                "anomaly_count": 2,
-                "duplicate_count": 1,
-                "regression_count": 1,
-                "maximum_regression_ns": 5_000_000,
-            })
+    def test_timestamp_anomaly_is_rejected_logged_and_retained_as_failed(self):
+        for bad_stamp, classification, delta_ns in (
+            (1_010_000_000, "duplicate", 0),
+            (1_005_000_000, "regression", -5_000_000),
+        ):
+            with self.subTest(classification=classification), tempfile.TemporaryDirectory() as raw:
+                output = Path(raw) / "session"
+                records = [sample(1_000_000_000), sample(1_010_000_000), sample(bad_stamp)]
+                with self.assertRaisesRegex(RuntimeError, "not strictly increasing"):
+                    self.run_capture(output, records=records)
+                failed = Path(str(output) + ".failed")
+                self.assertFalse(output.exists())
+                self.assertTrue(failed.is_dir())
+                with (failed / "imu/imu0.csv").open() as stream:
+                    rows = list(csv.reader(stream))
+                self.assertEqual([int(row[0]) for row in rows[1:]],
+                                 [1_000_000_000, 1_010_000_000])
+                anomalies = [json.loads(line) for line in
+                             (failed / "meta/imu_timestamp_anomalies.jsonl")
+                             .read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(anomalies), 1)
+                self.assertEqual(anomalies[0]["classification"], classification)
+                self.assertEqual(anomalies[0]["delta_ns"], delta_ns)
+                self.assertEqual(anomalies[0]["previous"]["timestamp_ns"], 1_010_000_000)
+                self.assertEqual(anomalies[0]["current"]["timestamp_ns"], bad_stamp)
+                self.assertEqual(anomalies[0]["current"]["angular_velocity"], [0.1, -0.2, 0.3])
+                session = json.loads((failed / "meta/session.json").read_text())
+                self.assertEqual(session["capture_status"], "failed")
+                self.assertEqual(session["timestamp_policy"]["fatal_anomaly_count"], 1)
+                validation = json.loads((failed / "meta/validation.json").read_text())
+                self.assertEqual(validation["stats"]["imu_timestamp_anomaly_count"], 1)
+                self.assertTrue(any("fatal IMU timestamp anomaly" in item
+                                    for item in validation["errors"]))
 
     def test_flush_stall_and_write_failure(self):
         with tempfile.TemporaryDirectory() as raw:

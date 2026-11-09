@@ -2,6 +2,3 @@
 # rclpy and sensor_msgs are supplied by the sourced ROS 2 installation.
 # Optional grayscale conversion acceleration; use existing board packages.
 numpy>=1.24,<3
-# JPEG only: use the board's existing cv2/NumPy; do not install board packages.
-# For a separate PC environment without cv2:
-opencv-python-headless>=4.5,<5

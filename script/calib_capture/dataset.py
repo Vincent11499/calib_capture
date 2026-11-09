@@ -19,10 +19,10 @@ from .axera import (
     FORMAT_NAMES,
     AxImgInfo,
     AxVideoFrame,
-    GrayFrame,
+    ImageFrame,
     GrayPair,
 )
-from .image_io import ensure_image_support, image_suffix, write_mono8_image
+from .image_io import ensure_image_support, image_suffix, write_image, write_mono8_image
 from .config import (
     APP_VERSION, CAPTURE_LAYOUT, DATASET_SCHEMA_VERSION, KALIBR_MANIFEST_MARKER,
     KALIBR_MANIFEST_VERSION, CaptureConfig, SDK_HEADER_SHA256,
@@ -101,7 +101,7 @@ def kalibr_manifest(
         [{"id": "cam0", "timestamps": "cameras/cam0/timestamps.csv",
           "images": "cameras/cam0", "frame_id": "usb_camera",
           "resolution": [config["width"], config["height"]],
-          "clock_source": "axera_pts_us"}]
+          "clock_source": "axera_ivps_pts_ns"}]
         if usb else
         [
             {"id": camera,
@@ -154,15 +154,15 @@ def capture_dataset_yaml(
             f"mode: {_yaml_scalar(config.mode)}",
             "capture_api: AX_IVPS_GetChnFrame",
             f"ivps: {{grp: {USB_IVPS_GRP}, chn: {USB_IVPS_CHN}}}",
+            "source_pts_unit: ns",
             "source_pixel_format: runtime",
             f"image_format: {config.image_format}",
-            f"jpeg_quality: {config.jpeg_quality}",
-            f"lossy: {_yaml_scalar(config.image_format == 'jpeg')}",
+            f"pixel_format: {config.pixel_format}",
             "cameras:",
             "  cam0:",
             "    side: usb",
             "    frame_id: \"usb_camera\"",
-            "    encoding: mono8",
+            f"    encoding: {'rgb8' if config.pixel_format == 'rgb' else 'mono8'}",
             f"    resolution: [{config.width}, {config.height}]",
             "    timestamps: cameras/cam0/timestamps.csv",
             "imu:",
@@ -182,8 +182,7 @@ def capture_dataset_yaml(
         "capture_api: AX_VIN_GetYuvFrame",
         "source_pixel_format: NV12",
         f"image_format: {config.image_format}",
-        f"jpeg_quality: {config.jpeg_quality}",
-        f"lossy: {_yaml_scalar(config.image_format == 'jpeg')}",
+        "pixel_format: mono8",
         "cameras:",
         "  cam0:",
         "    side: left",
@@ -225,7 +224,7 @@ class PendingPair:
 
 @dataclass
 class PendingFrame:
-    frame: GrayFrame
+    frame: ImageFrame
     temporary: Path
     final: Path
     future: Future
@@ -239,7 +238,7 @@ class DatasetWriter:
     """Owns one recoverable directory-dataset staging area."""
 
     def __init__(self, output: str | Path, config: CaptureConfig, include_imu: bool) -> None:
-        ensure_image_support(config.image_format)
+        ensure_image_support(config.image_format, config.pixel_format)
         if include_imu and is_usb_mode(config.mode):
             raise ValueError("USB capture modes do not record IMU")
         final_path = Path(output).expanduser().resolve()
@@ -424,7 +423,7 @@ class DatasetWriter:
             for path, pixels in jobs:
                 futures.append(self._image_executor.submit(
                     write_mono8_image, path, pair.width, pair.height, pixels,
-                    self.config.image_format, self.config.jpeg_quality, pair.bottom_up))
+                    self.config.image_format, pair.bottom_up))
         except BaseException:
             self.cancel_pair(pending)
             raise
@@ -486,12 +485,12 @@ class DatasetWriter:
         if self._first_camera_timestamp is None:
             self._first_camera_timestamp = min(pair.left_timestamp_ns, pair.right_timestamp_ns)
 
-    def write_frame(self, frame: GrayFrame, *, filename_stem: str | None = None) -> None:
+    def write_frame(self, frame: ImageFrame, *, filename_stem: str | None = None) -> None:
         """Synchronous single-camera path used by USB triggered capture."""
         self.finish_frame(self.start_frame(frame, filename_stem=filename_stem))
 
     def start_frame(
-        self, frame: GrayFrame, *, filename_stem: str | None = None,
+        self, frame: ImageFrame, *, filename_stem: str | None = None,
     ) -> PendingFrame:
         if not self.single_camera:
             raise RuntimeError("single-camera writes require a USB dataset")
@@ -503,6 +502,12 @@ class DatasetWriter:
             raise ValueError("frame resolution differs from dataset resolution")
         if frame.source_format not in FORMAT_NAMES:
             raise ValueError(f"unsupported USB source format: 0x{frame.source_format:x}")
+        expected_encoding = "rgb8" if self.config.pixel_format == "rgb" else "mono8"
+        if frame.encoding != expected_encoding:
+            raise ValueError(
+                f"USB frame encoding {frame.encoding!r} differs from configured "
+                f"{expected_encoding!r}"
+            )
         if frame.timestamp_ns <= self._last_submitted_frame:
             raise ValueError("USB camera timestamp is not strictly increasing")
         if filename_stem is None:
@@ -515,8 +520,9 @@ class DatasetWriter:
             raise FileExistsError(f"image filename already exists: {name}")
         temporary = final.with_name("." + name + ".tmp")
         future = self._image_executor.submit(
-            write_mono8_image, temporary, frame.width, frame.height, frame.pixels,
-            self.config.image_format, self.config.jpeg_quality, frame.bottom_up,
+            write_image, temporary, frame.width, frame.height, frame.pixels,
+            self.config.image_format, self.config.pixel_format,
+            frame.bottom_up,
         )
         self._last_submitted_frame = frame.timestamp_ns
         return PendingFrame(frame, temporary, final, future, started_ns)

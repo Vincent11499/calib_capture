@@ -16,7 +16,7 @@ RAW 接受 Bayer RAW(0x80..0x87) + NONE(0) 或 LOSSLESS(1)。每帧记录 `compr
 
 会话名称为 `<dataset_name>_YYMMDD_hhmm`，例如 `evt31_260909_1517`。日期来自运行设备本地时间，只用于命名，不能当作传感器时间。session 另外记录 UTC 创建与封存时间。
 
-`--output` 是输出根目录，默认 `./data`；`dataset_name` 可由 INI 或 CLI 显式指定，默认普通双目 `stereo`、base_link 固定姿态双目 `stereo_base_link`、Stereo–IMU `stereo_imu`、USB 连续 `usb`、USB 固定姿态 `usb_baselink`、独立 IMU `imu`。前缀范围为 1–64 个 ASCII 字母、数字、下划线、连字符，首字符是字母或数字；空 INI 值表示模式默认。相同前缀一分钟内重复启动报错，正式目录及 `.inprogress`、`.failed` 均不覆盖。
+`--output` 是输出根目录，默认 `./data`；`dataset_name` 可由 INI 或 CLI 显式指定，默认普通双目 `stereo`、base_link 固定姿态双目 `stereo_base_link`、Stereo–IMU `stereo_imu`、USB 连续 `usb`、USB 固定姿态 `usb_base_link`、独立 IMU `imu`。前缀范围为 1–64 个 ASCII 字母、数字、下划线、连字符，首字符是字母或数字；空 INI 值表示模式默认。相同前缀一分钟内重复启动报错，正式目录及 `.inprogress`、`.failed` 均不覆盖。
 
 ```text
 dataset.yaml
@@ -32,12 +32,12 @@ meta/session.json
 meta/validation.json
 ```
 
-纯双目不创建 IMU 文件；Camera–IMU 只保存一份 IMU CSV。采集器只写灰度 BMP 或 JPG；Kalibr reader 也支持 PNG、JPEG/JPG、BMP。所有 manifest 路径相对数据集根目录，图像 CSV 文件名相对该相机 images 目录，不允许越界。
+纯双目不创建 IMU 文件；Stereo–IMU 只保存一份 IMU CSV。VIN 双目固定写 mono8 BMP；USB 默认写 rgb8 24-bit BMP，也可显式写 mono8 BMP。所有 manifest 路径相对数据集根目录，图像 CSV 文件名相对该相机 images 目录，不允许越界。
 
 USB 两个命令是单相机布局，只创建 `cameras/cam0/` 和
 `meta/frames.csv`，不创建 `cam1`、`pairs.csv` 或 IMU 目录。`frames.csv` 为
 `frame_index,timestamp_ns,sequence,source_format`。根 manifest 的 `cameras`
-只有 `cam0`；来源固定为 `AX_IVPS_GetChnFrame` grp 3/chn 0、1920×1080。
+只有 `cam0`；来源固定为 `AX_IVPS_GetChnFrame` grp 3/chn 0、1280×960。
 `usb-baselink-triggered` 的文件名使用相同 14 个姿态名，真实 PTS 仍写在
 `timestamps.csv`。
 
@@ -82,27 +82,27 @@ imus:
 
 - 双目数据中 cam0 恒为左目、cam1 恒为右目；默认 VIN 分别是 pipe 2/chn 0、pipe 0/chn 0。USB 单相机数据只有 cam0，来源为 IVPS grp 3/chn 0，不代表双目左目。
 - `timestamps.csv` 严格为 `timestamp_ns,filename`。普通模式例如 `63359465332000,63359465332000.bmp`；`stereo-baselink-triggered` 使用固定姿态文件名，例如 `63359465332000,43_0_0.bmp`，左右真实时间戳仍各自保留在第一列。
-- 相机各自保存 `u64PTS × 1000` 纳秒，`clock_source: axera_pts_us` 说明硬件源单位是微秒，CSV 始终是纳秒。IMU 保留 ROS 原始 header stamp；所有时间戳必须为 `[0, 2^63-1]` 范围内整数且各流严格递增。
+- VIN 双目保存 `u64PTS × 1000` 纳秒，使用 `clock_source: axera_pts_us`；USB IVPS grp 3 的 PTS 已是纳秒，原值保存并使用 `clock_source: axera_ivps_pts_ns`。IMU 保留 ROS 原始 header stamp；所有 CSV 时间戳必须为 `[0, 2^63-1]` 范围内整数且各流严格递增。
 - `imu/imu0.csv` 严格为 `timestamp_ns,wx,wy,wz,ax,ay,az`；角速度 rad/s，加速度 m/s²。不交换轴、不变号、不缩放、不因图像限频裁剪 IMU。
 - `meta/pairs.csv` 为 `pair_index,left_timestamp_ns,right_timestamp_ns,left_sequence,right_sequence,delta_us,left_format,right_format`。保留两侧原始时间戳，不写平均时间。
 - 默认双目同步容差 200 µs，含边界；超限重取较早侧，最多 10 次。Kalibr camera task 可显式使用 `synchronization_tolerance_s: 0.0002`，这是标定配对参数，不是目录 manifest 字段或通用 Camera–IMU 参数。
 - IMU 非空原始 frame ID 优先，空值才回退配置 `imu_frame_id` 并告警；会话内有效 frame ID 变化失败。JSONL 始终保存原始字符串，包括空值；ROS1 导出只为空值应用有效 frame ID。
 - Camera–IMU 默认按实际传感器时间核验前后各 1 秒 IMU，`imu_preroll_s/imu_postroll_s` 允许非负有限秒数。没有共同窗口、回退时间、覆盖不足或停流均为失败；同启动阶段相机与 IMU 参照差超过默认 5 秒也失败。
 
-图像默认无损 mono8 BMP，保留 bottom-up 布局；可选 JPEG quality 95（1–100）保存有损单通道 JPG。同一会话格式一致，不缩放；JPEG 不代表亚像素角点无损。根 manifest 分辨率必须等于真实落盘尺寸。
+VIN 图像固定为无损 mono8 BMP，保留 bottom-up 布局。USB 图像默认为 top-down 逻辑 rgb8，保存成标准 24-bit BMP；运行时源可以是 NV12、NV21、YUV400 或 packed RGB/BGR，实际枚举逐帧保存在 `meta/frames.csv`。`--pixel-format mono8` 使用灰度 BMP。同一会话落盘像素格式一致，不缩放。根 manifest 分辨率必须等于真实落盘尺寸。
 
 ## 元数据、质量和恢复
 
 | 文件／结构 | kind | 主要内容 |
 |---|---|---|
-| meta/capture_dataset.yaml | capture_dataset | 硬件映射、源格式、尺寸、图像格式与有损标记 |
+| meta/capture_dataset.yaml | capture_dataset | 硬件映射、源格式、尺寸、image/pixel format、encoding 与有损标记 |
 | meta/session.json | capture_session | dataset_id、软件版本、完整有效配置、UTC 时间、计数、SDK 契约、性能与时序 |
 | meta/imu_full.jsonl 每行 | imu_message | 原 header frame ID、时间、六轴、orientation、covariance、回调到达时刻 |
 | meta/validation.json | capture_validation | 结构与采集时序的 pass/warning/fail、错误、警告和统计 |
 
 表内结构的 `schema_version` 均为字符串 `1.0.0`。session 的 `dataset_manifest` 为 `kalibr_directory_dataset`、`capture_layout` 为 `compact`。采集器检查根 manifest、内部 manifest、CSV、JSONL、session 之间的一致性。原始消息内容及其数值保留；版本和 kind 只标识包装结构。
 
-数据完整性为 `structural`，不计算逐帧 SHA-256。BMP 检查格式、长度和尺寸；JPEG 检查首尾标志并完整解码。两者都不保证检测所有等长度或仍可解码的像素改动。SDK 启动契约哈希继续独立核验。
+数据完整性为 `structural`，不计算逐帧 SHA-256。BMP 检查格式、长度和尺寸，但不保证检测所有等长度的像素改动。SDK 启动契约哈希继续独立核验。
 
 写盘先使用隐藏临时文件，左右两图完成后按提交顺序写文件与 CSV；队列默认两对，编码线程默认两个，容量有界，满时整对丢弃。CSV/JSONL 每 0.5 秒刷新，正常停止最终刷新；强杀或断电可能丢失未刷记录。失败保留 `.failed`，校验完成后才提交正式目录。
 
@@ -130,7 +130,7 @@ Allan 可用 `--start-s/--end-s` 选择相对第一条 IMU 的秒数区间 `[sta
 
 启动先等到温度，再保存后续 IMU 并开始计时；之前的 IMU 为预热跳过，不缓存或倒填未来温度。缺温度/IMU 共用启动超时。温度停止更新时继续沿用旧值，沿用时间超过 2 秒只告警。session.temperature 记录话题、类型、单位、更新数、最大沿用秒数和预热跳过数。校验要求新增八列和温度 metadata，不自动修改旧七列独立采集文件。
 
-`imu-continuous` 用于原始 IMU 诊断采集，不调用相机 SDK。输出 `imu/imu0.csv`、`meta/imu_timestamp_anomalies.jsonl`、`meta/session.json` 和 `meta/validation.json`，无双目 manifest、图像或完整消息 JSONL；session kind 为 `imu_capture_session`，layout 为 `imu_allan_csv`，版本仍为 `1.0.0`。逐行处理，不因时长无限缓存；原始单位、header stamp 和回调到达顺序不变。时间戳重复或回退时继续保存 CSV，并把相邻异常记录写入 JSONL；`session.timestamp_quality` 和 validation 记录重复数、回退数及最大回退量。含这类警告的数据不能直接用于 Allan/Kalibr，必须先定位上游数据源；分析工具仍要求严格递增。至少需要两条有限样本，非正/越界时间戳、停流或坐标系变化失败。
+`imu-continuous` 用于原始 IMU 诊断采集，不调用相机 SDK。输出 `imu/imu0.csv`、`meta/imu_timestamp_anomalies.jsonl`、`meta/session.json` 和 `meta/validation.json`，无双目 manifest、图像或完整消息 JSONL；session kind 为 `imu_capture_session`，layout 为 `imu_allan_csv`，版本仍为 `1.0.0`。逐行处理，不因时长无限缓存；原始单位、header stamp 和回调到达顺序不变。时间戳必须严格递增：首个重复或回退样本不写入 CSV，而是将上一条已接受样本、当前被拒绝样本、时间差、六轴和回调到达时间写入 JSONL，随即停止并保留 `.failed`。`session.timestamp_policy` 保存严格要求、日志路径和异常数量；非空异常日志在 validation 中是硬失败。正常完成目录仍创建空日志，用于证明未发现这类异常。至少需要两条有限样本，非正/越界时间戳、停流或坐标系变化同样失败。
 
 可选 ROS1 `imu_utils` 交叉分析只读取八列 `imu/imu0.csv`，不要求输入元数据，构造只用于回放的派生 bag，但该
 文件不是本项目 `export-ros1` 的正式输出，也不属于 v1.0.0 数据集。原会话必须只读；
@@ -140,4 +140,4 @@ bag 和 `imu_utils` 的 TXT/YAML/PNG/日志/报告统一放在独立的 `data/al
 的准确时间，因此不从沿用温度值伪造温度 topic。派生 bag 必须逐条回读，运行结果必须
 证明六轴 `numData` 全部等于 bag 消息数。详细流程见 [imu_utils 容器与分析说明](docker/IMU_UTILS.md)。
 
-ROS1 导出仅用于新双目／Camera–IMU 数据，要求 PC 的 `rosbags==0.11.0`。消息 Header stamp 与 bag record time 都等于源时间；图像类型为 mono8 Image，JPEG 先解码，不能恢复压缩前像素。导出按时间归并，完成后重新打开核对类型、数量、时间范围和 Header。ROS 消息与 bag 格式属于第三方标准，不增加本项目 schema 字段；导出 JSON 报告使用 `kind: ros1_export_result`、`schema_version: "1.0.0"`。
+ROS1 导出仅用于新双目／Stereo–IMU 数据，要求 PC 的 `rosbags==0.11.0`。消息 Header stamp 与 bag record time 都等于源时间；图像类型为 mono8 Image，并从 BMP 读取。导出按时间归并，完成后重新打开核对类型、数量、时间范围和 Header。ROS 消息与 bag 格式属于第三方标准，不增加本项目 schema 字段；导出 JSON 报告使用 `kind: ros1_export_result`、`schema_version: "1.0.0"`。

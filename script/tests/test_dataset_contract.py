@@ -338,8 +338,7 @@ class DatasetContractTests(unittest.TestCase):
                 self.assert_invalid(path)
 
     def test_nonfinite_numeric_metadata_is_a_reported_failure_not_an_exception(self) -> None:
-        cases = (("config", "jpeg_quality"), ("config", "width"),
-                 ("config", "sync_tolerance_us"), ("config", "save_rate_hz"),
+        cases = (("config", "width"), ("config", "sync_tolerance_us"), ("config", "save_rate_hz"),
                  ("config", "expected_source_rate_hz"), ("config", "imu_expected_rate_hz"),
                  ("session", "pair_count"), ("session", "ax_deinit_result"),
                  ("capture_stats", "writer_queue_drop_pairs"),
@@ -543,7 +542,7 @@ class DatasetContractTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         build_capture_config(mode="stereo-imu", overrides={key: value})
 
-    def test_roll_ini_and_cli_obey_precedence_without_changing_image_duration(self) -> None:
+    def test_roll_ini_and_cli_obey_precedence_with_operator_stopped_images(self) -> None:
         ini = self.root / "capture.ini"
         ini.write_text("[capture]\nschema_version = 1.0.0\nimu_preroll_s = 2.5\nimu_postroll_s = 3\n", encoding="utf-8")
         parser = build_parser()
@@ -551,7 +550,7 @@ class DatasetContractTests(unittest.TestCase):
         config = _capture_config(args, "stereo-imu")
         self.assertEqual(config.imu_preroll_s, 0.0)
         self.assertEqual(config.imu_postroll_s, 3.0)
-        self.assertEqual(config.duration_s, 60.0)
+        self.assertIsNone(config.duration_s)
         args = parser.parse_args(["stereo-imu", "--imu-preroll-s", "1.5", "--imu-postroll-s", "0"])
         config = _capture_config(args, "stereo-imu")
         self.assertEqual(config.imu_preroll_s, 1.5)

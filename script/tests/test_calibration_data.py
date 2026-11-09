@@ -31,6 +31,7 @@ from calib_capture.axera import (
     AxVideoFrame,
     GrayPair,
     StereoGrabber,
+    VinGetFrameError,
     _load_ax_libraries,
     packed_frame_to_gray,
     validate_frame_metadata,
@@ -372,6 +373,30 @@ class AxVinAbiTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_continuous_camera_duration_is_optional_for_ctrl_c(self) -> None:
+        parser = build_parser()
+        for mode in ("stereo-continuous", "stereo-imu", "usb-continuous"):
+            with self.subTest(mode=mode):
+                config = _capture_config(parser.parse_args([mode]), mode)
+                self.assertIsNone(config.duration_s)
+                timed = _capture_config(
+                    parser.parse_args([mode, "--duration-s", "12.5"]), mode
+                )
+                self.assertEqual(timed.duration_s, 12.5)
+
+    def test_continuous_camera_ini_duration_remains_effective(self) -> None:
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as raw:
+            ini = Path(raw) / "capture.ini"
+            ini.write_text(
+                "[capture]\nschema_version = 1.0.0\nduration_s = 7.5\n",
+                encoding="utf-8",
+            )
+            for mode in ("stereo-continuous", "stereo-imu", "usb-continuous"):
+                with self.subTest(mode=mode):
+                    args = parser.parse_args(["--config", str(ini), mode])
+                    self.assertEqual(_capture_config(args, mode).duration_s, 7.5)
+
     def test_default_cali_mapping_is_full_resolution_vin(self) -> None:
         config = build_capture_config(mode="probe")
         self.assertEqual((config.left_pipe, config.left_chn), (2, 0))
@@ -730,8 +755,13 @@ class StereoGrabberTests(unittest.TestCase):
 
     def test_right_get_failure_releases_left_exactly_once(self) -> None:
         api = FakeVinApi({2: [make_frame(100, 1)], 0: [-1]})
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(VinGetFrameError) as raised:
             make_grabber(api).grab_frames()
+        self.assertEqual(
+            (raised.exception.side, raised.exception.pipe, raised.exception.chn),
+            ("right", 0, 0),
+        )
+        self.assertEqual(raised.exception.result_hex, "0xffffffff")
         self.assertEqual(api.releases, [(2, 1)])
 
     def test_metadata_failure_releases_both_frames_exactly_once(self) -> None:

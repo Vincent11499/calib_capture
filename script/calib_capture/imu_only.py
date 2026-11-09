@@ -30,11 +30,13 @@ class ImuCsvWriter:
         anomaly_path: Path | None = None,
     ) -> None:
         self.stream = path.open("x", encoding="utf-8", newline="")
+        anomaly_path = anomaly_path or path.with_name(path.stem + "_timestamp_anomalies.jsonl")
+        try:
+            self.anomaly_stream = anomaly_path.open("x", encoding="utf-8")
+        except BaseException:
+            self.stream.close()
+            raise
         self.writer = csv.writer(self.stream)
-        self.anomaly_stream = (
-            anomaly_path.open("x", encoding="utf-8", newline="")
-            if anomaly_path is not None else None
-        )
         self.use_temperature = use_temperature
         self.writer.writerow(CSV_FIELDS if use_temperature else IMU_FIELDS)
         self.lock = threading.Lock()
@@ -43,17 +45,38 @@ class ImuCsvWriter:
         self.empty_ids = 0
         self.count = 0
         self.last_stamp = 0
-        self.last_values: tuple[float, ...] | None = None
-        self.last_temperature: float | None = None
-        self.timestamp_duplicate_count = 0
-        self.timestamp_regression_count = 0
-        self.timestamp_max_regression_ns = 0
         self.last_arrival = time.monotonic()
         self.temperature = None
         self.temperature_updates = 0
         self.temperature_arrival = None
         self.temperature_max_age_s = 0.0
         self.imu_before_temperature = 0
+        self.timestamp_anomaly_count = 0
+
+    @staticmethod
+    def _anomaly_sample(record: ImuRecord) -> dict:
+        return {
+            "timestamp_ns": record.timestamp_ns,
+            "frame_id": record.frame_id,
+            "angular_velocity": list(record.angular_velocity),
+            "linear_acceleration": list(record.linear_acceleration),
+            "arrival_monotonic_ns": record.arrival_monotonic_ns,
+        }
+
+    def record_timestamp_anomaly(self, previous: ImuRecord, current: ImuRecord) -> None:
+        """Persist the rejected sample and its accepted predecessor before capture fails."""
+        delta_ns = current.timestamp_ns - previous.timestamp_ns
+        payload = {
+            "classification": "duplicate" if delta_ns == 0 else "regression",
+            "delta_ns": delta_ns,
+            "accepted_count": self.count,
+            "previous": self._anomaly_sample(previous),
+            "current": self._anomaly_sample(current),
+        }
+        with self.lock:
+            self.anomaly_stream.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            self.anomaly_stream.flush()
+            self.timestamp_anomaly_count += 1
 
     def update_temperature(self, message) -> None:
         # Temperature is degrees Celsius; variance (including NaN) is not used.
@@ -73,46 +96,13 @@ class ImuCsvWriter:
             values = (*record.angular_velocity, *record.linear_acceleration)
             if len(values) != 6 or not all(math.isfinite(v) for v in values):
                 raise ValueError("IMU six-axis values must be finite")
-            if not 0 < record.timestamp_ns < 2**63:
-                raise ValueError("IMU timestamp must be positive and < 2^63")
+            if not self.last_stamp < record.timestamp_ns < 2**63:
+                raise ValueError("IMU timestamp must be positive, strictly increasing and < 2^63")
             effective_id = record.frame_id or self.fallback
             if not effective_id:
                 raise ValueError("IMU frame_id and fallback are both empty")
             if self.frame_id is not None and effective_id != self.frame_id:
                 raise ValueError("IMU effective frame_id changed")
-            if self.count and record.timestamp_ns <= self.last_stamp:
-                delta_ns = record.timestamp_ns - self.last_stamp
-                if delta_ns == 0:
-                    self.timestamp_duplicate_count += 1
-                    classification = "duplicate"
-                else:
-                    self.timestamp_regression_count += 1
-                    self.timestamp_max_regression_ns = max(
-                        self.timestamp_max_regression_ns, -delta_ns
-                    )
-                    classification = "regression"
-                if self.anomaly_stream is not None:
-                    payload = {
-                        "arrival_index": self.count + 1,
-                        "classification": classification,
-                        "delta_ns": delta_ns,
-                        "previous": {
-                            "timestamp_ns": self.last_stamp,
-                            "angular_velocity": self.last_values[:3],
-                            "linear_acceleration": self.last_values[3:],
-                            "temperature": self.last_temperature,
-                        },
-                        "current": {
-                            "timestamp_ns": record.timestamp_ns,
-                            "angular_velocity": record.angular_velocity,
-                            "linear_acceleration": record.linear_acceleration,
-                            "temperature": self.temperature,
-                            "arrival_monotonic_ns": record.arrival_monotonic_ns,
-                        },
-                    }
-                    self.anomaly_stream.write(
-                        json.dumps(payload, separators=(",", ":")) + "\n"
-                    )
             row = (record.timestamp_ns, *values)
             self.writer.writerow((*row, self.temperature) if self.use_temperature else row)
             if self.use_temperature:
@@ -122,23 +112,18 @@ class ImuCsvWriter:
             self.empty_ids += int(not record.frame_id)
             self.count += 1
             self.last_stamp = record.timestamp_ns
-            self.last_values = values
-            self.last_temperature = self.temperature
             self.last_arrival = time.monotonic()
 
     def flush_and_check(self, timeout_s: float) -> None:
         with self.lock:
             self.stream.flush()
-            if self.anomaly_stream is not None:
-                self.anomaly_stream.flush()
             if time.monotonic() - self.last_arrival > timeout_s:
                 raise RuntimeError(f"IMU stream stalled for more than {timeout_s:g} s")
 
     def close(self) -> None:
         with self.lock:
             self.stream.close()
-            if self.anomaly_stream is not None:
-                self.anomaly_stream.close()
+            self.anomaly_stream.close()
 
 
 def is_imu_only(path: str | Path) -> bool:
@@ -152,8 +137,7 @@ def validate_imu_only(path: str | Path, *, write_report: bool = False) -> Valida
     """Read rows incrementally, even for multi-hour recordings."""
     root = Path(path)
     report = ValidationReport()
-    count = first = last = minimum_stamp = maximum_stamp = maximum_gap = long_gaps = 0
-    duplicate_count = regression_count = maximum_regression_ns = 0
+    count = first = last = maximum_gap = long_gaps = 0
     try:
         session = json.loads((root / "meta/session.json").read_text(encoding="utf-8"))
         if session.get("schema_version") != DATASET_SCHEMA_VERSION or session.get("kind") != "imu_capture_session":
@@ -174,70 +158,44 @@ def validate_imu_only(path: str | Path, *, write_report: bool = False) -> Valida
                 if len(row) != len(expected_fields):
                     raise ValueError(f"invalid IMU CSV row {count + 2}")
                 stamp = int(row[0])
-                if not 0 < stamp < 2**63:
-                    raise ValueError(f"invalid IMU timestamp at row {count + 2}")
+                if not last < stamp < 2**63:
+                    raise ValueError(f"IMU timestamp not strictly increasing at row {count + 2}")
                 if not all(math.isfinite(float(v)) for v in row[1:]):
                     raise ValueError(f"non-finite IMU value at row {count + 2}")
                 if count:
                     gap = stamp - last
-                    if gap == 0:
-                        duplicate_count += 1
-                    elif gap < 0:
-                        regression_count += 1
-                        maximum_regression_ns = max(maximum_regression_ns, -gap)
-                    else:
-                        maximum_gap = max(maximum_gap, gap)
-                        long_gaps += int(gap > 1.5e9 / expected_rate)
+                    maximum_gap = max(maximum_gap, gap)
+                    long_gaps += int(gap > 1.5e9 / expected_rate)
                 else:
                     first = stamp
-                    minimum_stamp = maximum_stamp = stamp
-                minimum_stamp = min(minimum_stamp, stamp)
-                maximum_stamp = max(maximum_stamp, stamp)
                 last = stamp
                 count += 1
         if count < 2:
             raise ValueError("at least two IMU samples are required")
         if count != session["imu_count"]:
             raise ValueError("IMU CSV count differs from session")
+        anomaly_path = root / "meta/imu_timestamp_anomalies.jsonl"
+        anomaly_count = sum(
+            bool(line.strip()) for line in anomaly_path.read_text(encoding="utf-8").splitlines()
+        )
+        timestamp_policy = session.get("timestamp_policy", {})
+        if timestamp_policy.get("strictly_increasing_required") is not True:
+            raise ValueError("missing strict IMU timestamp policy")
+        if timestamp_policy.get("fatal_anomaly_log") != "meta/imu_timestamp_anomalies.jsonl":
+            raise ValueError("invalid fatal IMU timestamp anomaly log path")
+        if timestamp_policy.get("fatal_anomaly_count") != anomaly_count:
+            raise ValueError("IMU timestamp anomaly count differs from session")
+        report.stats["imu_timestamp_anomaly_count"] = anomaly_count
+        if anomaly_count:
+            report.error(f"fatal IMU timestamp anomaly journal contains {anomaly_count} record(s)")
         if not session.get("imu_frame_id"):
             raise ValueError("missing IMU frame_id")
-        timestamp_span_ns = maximum_stamp - minimum_stamp
-        if timestamp_span_ns <= 0:
-            raise ValueError("IMU timestamp range has no positive duration")
-        rate = (count - 1) * 1e9 / timestamp_span_ns
+        rate = (count - 1) * 1e9 / (last - first)
         report.stats.update(imu_count=count, imu_effective_rate_hz=rate,
                             imu_first_timestamp_ns=first, imu_last_timestamp_ns=last,
-                            imu_timestamp_min_ns=minimum_stamp,
-                            imu_timestamp_max_ns=maximum_stamp,
-                            imu_duration_s=timestamp_span_ns / 1e9,
+                            imu_duration_s=(last - first) / 1e9,
                             imu_maximum_gap_ns=maximum_gap, imu_long_gap_count=long_gaps,
-                            imu_timestamp_duplicate_count=duplicate_count,
-                            imu_timestamp_regression_count=regression_count,
-                            imu_timestamp_max_regression_ns=maximum_regression_ns,
                             imu_frame_id=session["imu_frame_id"])
-        expected_quality = session.get("timestamp_quality", {})
-        actual_anomalies = duplicate_count + regression_count
-        if expected_quality != {
-            "strictly_increasing": actual_anomalies == 0,
-            "anomaly_count": actual_anomalies,
-            "duplicate_count": duplicate_count,
-            "regression_count": regression_count,
-            "maximum_regression_ns": maximum_regression_ns,
-        }:
-            raise ValueError("IMU timestamp quality metadata disagrees with CSV")
-        anomaly_path = root / "meta/imu_timestamp_anomalies.jsonl"
-        if not anomaly_path.is_file():
-            raise ValueError("missing IMU timestamp anomaly journal")
-        with anomaly_path.open(encoding="utf-8") as anomaly_stream:
-            anomaly_lines = sum(1 for line in anomaly_stream if line.strip())
-        if anomaly_lines != actual_anomalies:
-            raise ValueError("IMU timestamp anomaly journal count disagrees with CSV")
-        if actual_anomalies:
-            report.warning(
-                "IMU header timestamps are not strictly increasing: "
-                f"duplicates={duplicate_count}, regressions={regression_count}, "
-                f"maximum_regression_ns={maximum_regression_ns}; all arrival-order rows were retained"
-            )
         if abs(rate / expected_rate - 1) > 0.1:
             report.warning("IMU effective rate differs from expected by more than 10%")
         if long_gaps:
@@ -289,14 +247,10 @@ def record_imu_only(config: CaptureConfig) -> tuple[Path, ValidationReport]:
                        imu_frame_id=writer.frame_id if writer else None,
                        imu_empty_frame_id_count=writer.empty_ids if writer else 0,
                        finished_utc=utc_now_text(), output=str(final))
-        duplicate_count = writer.timestamp_duplicate_count if writer else 0
-        regression_count = writer.timestamp_regression_count if writer else 0
-        session["timestamp_quality"] = {
-            "strictly_increasing": duplicate_count + regression_count == 0,
-            "anomaly_count": duplicate_count + regression_count,
-            "duplicate_count": duplicate_count,
-            "regression_count": regression_count,
-            "maximum_regression_ns": writer.timestamp_max_regression_ns if writer else 0,
+        session["timestamp_policy"] = {
+            "strictly_increasing_required": True,
+            "fatal_anomaly_log": "meta/imu_timestamp_anomalies.jsonl",
+            "fatal_anomaly_count": writer.timestamp_anomaly_count if writer else 0,
         }
         session["temperature"] = {
             "enabled": config.use_temperature,
@@ -320,7 +274,7 @@ def record_imu_only(config: CaptureConfig) -> tuple[Path, ValidationReport]:
         subscriber = ImuSubscriber(
             config, writer.write,
             temperature_callback=writer.update_temperature if config.use_temperature else None,
-            allow_non_increasing_timestamps=True,
+            timestamp_error_callback=writer.record_timestamp_anomaly,
         )
         print(f"IMU-only recording: {staging}; all received messages, no camera access")
         with _CaptureInterrupts() as interrupts:

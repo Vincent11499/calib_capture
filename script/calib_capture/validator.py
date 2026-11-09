@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable
 
-from .image_io import image_suffix, inspect_mono8_image
+from .image_io import image_suffix, inspect_image, inspect_mono8_image
 from .base_link import BASE_LINK_POSES
 from .config import (CAPTURE_LAYOUT, DATASET_SCHEMA_VERSION, DEFAULTS, KALIBR_MANIFEST_MARKER,
                      CaptureConfig, SDK_HEADER_SHA256)
@@ -198,13 +198,15 @@ def _validate_usb_dataset(
             f"USB resolution must be fixed at {USB_RESOLUTION[0]}x{USB_RESOLUTION[1]}"
         )
     stored_format = str(config.get("image_format", "bmp"))
+    stored_pixels = str(config.get("pixel_format", ""))
+    if stored_pixels not in {"rgb", "mono8"}:
+        report.error("missing or invalid USB pixel_format in session config")
+        stored_pixels = "mono8"
     try:
         suffix = image_suffix(stored_format)
     except ValueError as exc:
         report.error(str(exc))
         suffix = ".bmp"
-    if stored_format == "jpeg":
-        report.warning("JPEG storage is lossy; decoded pixels differ from the IVPS source")
     expected_abi = {"base_size": 232, "pts_offset": 192, "sequence_offset": 200}
     if session.get("ax_video_frame_abi") != expected_abi:
         report.error("session AX_VIDEO_FRAME_T ABI metadata does not match the pinned contract")
@@ -302,7 +304,7 @@ def _validate_usb_dataset(
             report.error(f"missing image: cameras/cam0/{filename}")
             continue
         try:
-            info = inspect_mono8_image(path)
+            info = inspect_image(path, stored_pixels)
             if (info.width, info.height) != USB_RESOLUTION:
                 report.error(
                     f"wrong USB image resolution {filename}: {info.width}x{info.height}"
@@ -311,7 +313,7 @@ def _validate_usb_dataset(
             report.error(f"invalid image cameras/cam0/{filename}: {exc}")
     extras = {
         path.name for path in (dataset / "cameras/cam0").iterdir()
-        if path.suffix.lower() in {".bmp", ".jpg", ".jpeg"}
+        if path.suffix.lower() == ".bmp"
     } - referenced
     if extras:
         report.error("unreferenced cam0 image files: " + ", ".join(sorted(extras)[:5]))
@@ -373,6 +375,7 @@ def _validate_usb_dataset(
         report.warning(f"USB source sequence regressions observed: {source_regressions}")
     report.stats = {
         "mode": mode,
+        "pixel_format": stored_pixels,
         "cam0_count": len(camera_rows),
         "cam1_count": 0,
         "imu_count": 0,
@@ -459,16 +462,9 @@ def validate_dataset(
     except ValueError as exc:
         report.error(str(exc))
         suffix = ".bmp"
-    if stored_format == "jpeg":
-        report.warning("JPEG storage is lossy; exported mono8 pixels are decoded JPEG, not original pixels")
     if schema_version == DATASET_SCHEMA_VERSION:
         if "image_format" not in config:
             report.error("missing image_format in session config")
-        try:
-            if not 1 <= int(config["jpeg_quality"]) <= 100:
-                raise ValueError("out of range")
-        except (KeyError, TypeError, ValueError, OverflowError):
-            report.error("invalid or missing jpeg_quality in session config")
     expected_abi = {"base_size": 232, "pts_offset": 192, "sequence_offset": 200}
     if session.get("ax_video_frame_abi") != expected_abi:
         report.error("session AX_VIDEO_FRAME_T ABI metadata does not match the pinned contract")
@@ -562,9 +558,7 @@ def validate_dataset(
         if "data_integrity: structural" not in dataset_yaml:
             report.error(f"{metadata_file} is missing data_integrity: structural")
         if schema_version == DATASET_SCHEMA_VERSION:
-            for line in (f"image_format: {stored_format}",
-                         f"jpeg_quality: {config.get('jpeg_quality')}",
-                         f"lossy: {'true' if stored_format == 'jpeg' else 'false'}"):
+            for line in (f"image_format: {stored_format}",):
                 if line not in dataset_yaml.splitlines():
                     report.error(f"{metadata_file} is missing contract entry: {line}")
         resolution_line = f"    resolution: [{expected_width}, {expected_height}]"
@@ -767,7 +761,7 @@ def validate_dataset(
                     f"{info.width}x{info.height}"
                 )
         actual = {path.name for path in (dataset / "cameras" / camera).iterdir()
-                  if path.suffix.lower() in {".bmp", ".jpg", ".jpeg"}}
+                  if path.suffix.lower() == ".bmp"}
         extras = sorted(actual - referenced[camera])
         if extras:
             report.error(f"unreferenced {camera} image files: {', '.join(extras[:5])}")

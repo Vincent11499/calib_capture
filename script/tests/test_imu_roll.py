@@ -13,10 +13,11 @@ from unittest import mock
 from calib_capture import capture
 from calib_capture.capture import (
     CaptureFailed, ImuSubscriber, UserAbort, _CaptureInterrupts,
-    _check_startup_clock, _wait_imu_postroll, _wait_imu_preroll,
+    _check_startup_clock, _grab_frames_or_stop, _wait_imu_postroll,
+    _wait_imu_preroll,
 )
 from calib_capture.config import build_capture_config
-from calib_capture.axera import GrayPair
+from calib_capture.axera import GrayPair, VinGetFrameError
 from calib_capture.dataset import DatasetWriter, ImuRecord
 from calib_capture.pipeline import PairDiskWriter
 
@@ -260,7 +261,11 @@ class SubscriberTests(unittest.TestCase):
             "sensor_msgs": mock.Mock(),
             "sensor_msgs.msg": SimpleNamespace(Imu=object),
         }
-        subscriber = ImuSubscriber(build_capture_config(mode="stereo-imu"))
+        timestamp_error = mock.Mock()
+        subscriber = ImuSubscriber(
+            build_capture_config(mode="stereo-imu"),
+            timestamp_error_callback=timestamp_error,
+        )
         with mock.patch.dict(sys.modules, modules), mock.patch.object(capture.threading, "Thread"):
             subscriber.start()
             vector = SimpleNamespace(x=1.0, y=2.0, z=3.0, w=1.0)
@@ -282,25 +287,16 @@ class SubscriberTests(unittest.TestCase):
             subscriber._node.on_imu(message(20))
             subscriber._node.on_imu(message(10))
 
-            retained = []
-            relaxed = ImuSubscriber(
-                build_capture_config(mode="imu-continuous"),
-                retained.append,
-                allow_non_increasing_timestamps=True,
-            )
-            relaxed.start()
-            relaxed._node.on_imu(message(20))
-            relaxed._node.on_imu(message(10))
-
         with self.assertRaisesRegex(
             RuntimeError,
             r"previous=4000000020, current=4000000010, delta_ns=-10, "
             r"accepted_count=1.*angular_velocity=\(1\.0, 2\.0, 3\.0\)",
         ):
             subscriber.raise_if_failed()
-        self.assertIsNone(relaxed.error)
-        self.assertEqual([record.timestamp_ns for record in retained],
-                         [4_000_000_020, 4_000_000_010])
+        timestamp_error.assert_called_once()
+        previous, current = timestamp_error.call_args.args
+        self.assertEqual(previous.timestamp_ns, 4_000_000_020)
+        self.assertEqual(current.timestamp_ns, 4_000_000_010)
 
     def test_unexpected_ros_shutdown_is_an_error(self):
         subscriber = ImuSubscriber(build_capture_config(mode="stereo-imu"))
@@ -437,6 +433,9 @@ class CaptureFlowTests(unittest.TestCase):
 
             def grab_frames(self):
                 clock.sleep(0.1)
+                if interrupt == "capture_get_error" and state.copies:
+                    interrupts._on_signal(signal.SIGINT, None)
+                    raise VinGetFrameError("left", 2, 0, -2146369241)
                 if interrupt in {"capture", "second"} and state.copies:
                     interrupts._on_signal(signal.SIGINT, None)
                 pts_us = (10 * NS + round(clock.now * NS)) // 1000
@@ -561,6 +560,30 @@ class CaptureFlowTests(unittest.TestCase):
         self.assertEqual(state.saved_session["capture_status"], "operator_stopped")
         self.assertTrue(state.saved_session["capture_stats"]["operator_interrupted"])
         self.assertGreaterEqual(state.imu.last_timestamp_ns - state.dataset.last_camera_timestamp_ns, NS)
+
+    def test_first_ctrl_c_during_blocking_vin_get_still_finishes_postroll(self):
+        state = self.run_capture(interrupt="capture_get_error")
+        self.assertIsNotNone(state.saved_session)
+        self.assertEqual(state.saved_session["capture_status"], "operator_stopped")
+        self.assertEqual(
+            state.saved_session["capture_stats"]["operator_stop_get_error"],
+            {
+                "call": "AX_VIN_GetYuvFrame",
+                "side": "left",
+                "pipe": 2,
+                "chn": 0,
+                "result": -2146369241,
+                "result_hex": "0x80110127",
+            },
+        )
+
+    def test_vin_get_error_without_sigint_remains_fatal(self):
+        class FailingGrabber:
+            def grab_frames(self):
+                raise VinGetFrameError("left", 2, 0, -2146369241)
+
+        with self.assertRaises(VinGetFrameError):
+            _grab_frames_or_stop(FailingGrabber(), _CaptureInterrupts(), {})
 
     def test_ctrl_c_before_any_camera_saves_failed_dataset(self):
         state = self.run_capture(interrupt="preroll")

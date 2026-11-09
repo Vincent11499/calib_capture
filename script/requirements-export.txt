@@ -1,6 +1,4 @@
 numpy>=1.26,<3
-# Decode JPEG datasets with OpenCV; BMP does not require this codec.
-opencv-python-headless>=4.5,<5
 rosbags==0.11.0
 lz4>=4.3
 zstandard>=0.22

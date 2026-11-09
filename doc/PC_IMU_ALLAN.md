@@ -1,11 +1,12 @@
 # PC 端 IMU 诊断与 Allan 分析
 
-本文统一说明 IMU 时域／白噪声诊断和三套 Allan 分析流程：
+本文统一说明 IMU 时域／白噪声诊断和四套 Allan 分析流程：
 
 1. 项目原生时域与白噪声诊断；
 2. 项目原生 `allan_variance` 分析（命令 `allan`，Python AllanTools）；
-3. ROS1 `ALLAN_VARIANCE_ROS`（程序名 `allan_variance_ros`）；
-4. ROS1 `IMU_UTILS`（程序名 `imu_utils`）。
+3. 纯 Python `allan_variance_ros` 兼容实现（推荐替代原 C++ 计算）；
+4. ROS1 `ALLAN_VARIANCE_ROS` 历史实现；
+5. ROS1 `IMU_UTILS`（程序名 `imu_utils`）。
 
 这些流程都只读板端 `imu-continuous` 生成的 CSV，不修改原始数据。建议先运行 Python
 AllanTools 快速检查，再让两个 ROS 工具使用同一时间区间、同一个派生 bag 做交叉分析。
@@ -205,7 +206,28 @@ python script/calibration_data.py allan data/allan_variance/data/imu_260911_1502
 如果任一轴缺少可信的 −1/2 或 +1/2 区间，命令不会伪造缺失参数，也不会生成
 `kalibr_imu.yaml`；原因保存在 `analysis.json.noise_fit`。
 
-## 5. ROS 容器准备
+## 5. 纯 Python allan_variance_ros 兼容实现
+
+该入口直接用 Python/NumPy 读取八列 CSV 并计算原 C++ 的固定 9,999 点 Allan deviation，
+再用 SciPy/Matplotlib 复刻原版拟合和图片。不创建 bag，不需要 ROS、C++、Docker 或 PyYAML：
+
+```powershell
+python script/imu/allan/analyze_allan_variance.py `
+  data/allan_variance/data/imu_260911_1502 `
+  --start-h 1 --end-h 23
+```
+
+默认输出到：
+
+```text
+data/allan_variance/allan_variance_output/imu_260911_1502_1h-23h_allan_variance/
+```
+
+产物为 `imu.yaml`、两张曲线图、报告和 `work/allan_variance.csv`/JSON 验证记录。输入必须是
+八列 CSV；原文件只读，已有输出拒绝覆盖。算法、边界、单位、拟合段和三轴聚合与固定上游
+提交一致。详细说明见 [纯 Python 复现文档](PYTHON_ALLAN_VARIANCE.md)。
+
+## 6. ROS 容器准备（历史交叉分析）
 
 `allan_variance_ros` 和 `imu_utils` 共用一个长期 ROS1 Noetic 容器。Docker Desktop
 运行后，在 WSL 中执行：
@@ -226,7 +248,7 @@ docker compose ps
 
 两个分析任务共享运行锁，不要在同一容器中同时执行。
 
-## 6. imu_utils
+## 7. imu_utils
 
 ### 6.1 一键分析
 
@@ -270,7 +292,7 @@ data/allan_variance/imu_utils_output/imu_260911_1502_1h-6h/
 完整的容器内手动操作、验证脚本和产物解释见
 [imu_utils 专项说明](docker/IMU_UTILS.md)。
 
-## 7. allan_variance_ros
+## 8. allan_variance_ros 历史实现
 
 ### 7.1 独立一键分析
 
@@ -323,11 +345,12 @@ docker compose exec -T imu-utils bash /scripts/run_allan_variance_ros.sh \
 [allan_variance_ros 专项说明](docker/ALLAN_VARIANCE_ROS.md)，算法和拟合细节见
 [源码解读](ALLAN_VARIANCE_ROS_SOURCE.md)。
 
-## 8. 三套结果如何使用
+## 9. 四套结果如何使用
 
 | 工具 | 优点 | 主要限制 |
 | --- | --- | --- |
 | Python AllanTools | 启动快；直接读取会话；适合检查多个时间区间 | 非均匀采样需显式近似；自动拟合可能因缺少可信上升段而不输出 YAML |
+| Python allan_variance_ros 兼容实现 | 无 ROS/bag/C++；严格复现固定原版算法和 Kalibr YAML | 固定拟合策略仍需人工审查；仅接受八列 CSV |
 | imu_utils | 五项模型拟合；有完整 bag 回读和消息无丢失检查 | ROS 回放耗时；`gyr_w/acc_w` 不是 Kalibr random walk |
 | allan_variance_ros | 直接输出 Kalibr 格式候选；可与 imu_utils 共用 bag | 固定分箱和拟合策略仍需人工审查 |
 
@@ -335,9 +358,10 @@ docker compose exec -T imu-utils bash /scripts/run_allan_variance_ros.sh \
 
 1. 用 Python AllanTools 检查全段和多个子区间；
 2. 选定静止、温度较稳定且时长足够的区间；
-3. 用 `imu_utils` 生成并验证派生 bag；
-4. 将同一个 bag 交给 `allan_variance_ros`；
-5. 对比三套曲线和参数，人工检查 −1/2、最低点及 +1/2 区域；
-6. 将审查后的参数用于 Kalibr，并通过实际标定结果继续验证。
+3. 用纯 Python 兼容实现生成原版算法候选参数；
+4. 需要外部交叉分析时，再用 `imu_utils` 生成并验证派生 bag；
+5. 必要时将同一个 bag 交给历史 `allan_variance_ros`；
+6. 对比曲线和参数，人工检查 −1/2、最低点及 +1/2 区域；
+7. 将审查后的参数用于 Kalibr，并通过实际标定结果继续验证。
 
 `PASS` 只表示输入、计算和产物检查通过，不代表 IMU 噪声模型或最终标定质量已经验收。

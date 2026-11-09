@@ -28,7 +28,8 @@ NS_PER_SECOND = 1_000_000_000
 SESSION_DIRECTORY_FORMAT = "%y%m%d_%H%M"
 USB_IVPS_GRP = 3
 USB_IVPS_CHN = 0
-USB_RESOLUTION = (1920, 1080)
+USB_RESOLUTION = (1280, 960)
+USB_SOURCE_RATE_HZ = 30.0
 
 AUTHORITATIVE_SDK_INCLUDE = Path(
     r"D:\tool\mipi_tools\sensor_timing_check_tool\bsp_sdk\include"
@@ -57,7 +58,7 @@ DEFAULTS: dict[str, Any] = {
     "right_chn": 0,
     "resolution": "3840x2160",
     "image_format": "bmp",
-    "jpeg_quality": 95,
+    "pixel_format": "mono8",
     "image_workers": 2,
     "expected_source_rate_hz": 50.0,
     "save_rate_hz": 5.0,
@@ -194,12 +195,12 @@ class CaptureConfig:
     width: int
     height: int
     image_format: str
-    jpeg_quality: int
+    pixel_format: str
     image_workers: int
     expected_source_rate_hz: float
     save_rate_hz: float
     frame_divisor: int
-    duration_s: float
+    duration_s: float | None
     poses: int
     sync_tolerance_us: int
     max_sync_retries: int
@@ -264,6 +265,10 @@ def build_capture_config(
             "INI save_rate_hz and frame_divisor are mutually exclusive; choose one"
         )
     values = dict(DEFAULTS)
+    if is_usb_mode(mode):
+        # USB IVPS supplies packed colour frames.  Keep stereo/VIN mono8, while
+        # making lossless RGB BMP the built-in USB default.
+        values["pixel_format"] = "rgb"
     values.update(file_values)
     # Selecting a save rate at the higher-priority layer disables a divisor
     # inherited from INI. Selecting a divisor naturally makes save_rate_hz
@@ -281,22 +286,25 @@ def build_capture_config(
             "stereo-raw-triggered": "stereo_raw",
             STEREO_BASELINK_MODE: "stereo_base_link",
             USB_CONTINUOUS_MODE: "usb",
-            USB_BASELINK_MODE: "usb_baselink",
+            USB_BASELINK_MODE: "usb_base_link",
         }.get(mode, "stereo")
     validate_dataset_name(values["dataset_name"])
 
     width, height = parse_resolution(str(values.pop("resolution")))
     if is_usb_mode(mode):
         width, height = USB_RESOLUTION
+        values["expected_source_rate_hz"] = USB_SOURCE_RATE_HZ
         # USB IVPS capture is intentionally controlled only by PTS rate.  An
         # unrelated stereo frame_divisor in a shared INI must not change it.
         values["frame_divisor"] = 0
     values["image_format"] = str(values["image_format"]).lower()
-    if values["image_format"] not in {"bmp", "jpeg"}:
-        raise ValueError("image_format must be bmp or jpeg")
-    values["jpeg_quality"] = int(values["jpeg_quality"])
-    if not 1 <= values["jpeg_quality"] <= 100:
-        raise ValueError("jpeg_quality must be between 1 and 100")
+    if values["image_format"] != "bmp":
+        raise ValueError("image_format must be bmp; JPEG capture is not supported")
+    values["pixel_format"] = str(values["pixel_format"]).lower()
+    if values["pixel_format"] not in {"rgb", "mono8"}:
+        raise ValueError("pixel_format must be rgb or mono8")
+    if not is_usb_mode(mode) and values["pixel_format"] != "mono8":
+        raise ValueError("pixel_format=rgb is supported only by USB capture modes")
     values["image_workers"] = int(values["image_workers"])
     if not 1 <= values["image_workers"] <= 8:
         raise ValueError("image_workers must be between 1 and 8")

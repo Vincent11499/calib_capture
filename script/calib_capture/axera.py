@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import hashlib
 import os
 import time
@@ -30,6 +31,9 @@ FORMAT_NAMES = {
     AX_FORMAT_RGB888: "RGB888(memory=BGR)",
     AX_FORMAT_BGR888: "BGR888(memory=RGB)",
 }
+
+_LIBYUV: ctypes.CDLL | None = None
+_LIBYUV_LOAD_ATTEMPTED = False
 
 
 class AxFrameCompressInfo(ctypes.Structure):
@@ -271,6 +275,34 @@ def inspect_sdk_headers(include_dir: str) -> dict[str, Any]:
 
 def ax_return_code_text(value: int) -> str:
     return f"0x{ctypes.c_uint32(value).value:08x}"
+
+
+class IvpsGetFrameError(RuntimeError):
+    """Typed AX_IVPS_GetChnFrame failure, preserving its SDK diagnostics."""
+
+    def __init__(self, grp: int, chn: int, result: int) -> None:
+        self.grp = int(grp)
+        self.chn = int(chn)
+        self.result = int(result)
+        self.result_hex = ax_return_code_text(result)
+        super().__init__(
+            f"AX_IVPS_GetChnFrame(grp={self.grp}, chn={self.chn}) failed: "
+            f"{self.result_hex}"
+        )
+
+
+class VinGetFrameError(RuntimeError):
+    """Typed AX_VIN_GetYuvFrame failure, preserving its SDK diagnostics."""
+
+    def __init__(self, side: str, pipe: int, chn: int, result: int) -> None:
+        self.side = str(side)
+        self.pipe = int(pipe)
+        self.chn = int(chn)
+        self.result = int(result)
+        self.result_hex = ax_return_code_text(result)
+        super().__init__(
+            f"AX_VIN_GetYuvFrame({self.side}) failed: {self.result_hex}"
+        )
 
 
 def _resolve_ax_library_dir(explicit_dir: str) -> Path | None:
@@ -828,6 +860,295 @@ def packed_frame_to_gray(raw: bytes, width: int, height: int, stride: int, image
         return _gray_without_numpy(raw[:required], width, height, stride, image_format)
 
 
+def copy_packed_frame_to_gray(
+    pointer: int,
+    width: int,
+    height: int,
+    stride: int,
+    image_format: int,
+    destination: bytearray,
+    bottom_up: bool = False,
+) -> None:
+    """Convert mapped RGB/BGR directly into a reusable mono8 buffer."""
+    if len(destination) != width * height:
+        raise ValueError("image buffer size differs from frame resolution")
+    required = stride * height
+    try:
+        import numpy as np
+    except ImportError:
+        gray = _gray_without_numpy(
+            ctypes.string_at(pointer, required), width, height, stride, image_format
+        )
+        for row in range(height):
+            source = (height - 1 - row) * width if bottom_up else row * width
+            destination[row * width:(row + 1) * width] = gray[source:source + width]
+        return
+
+    mapped = (ctypes.c_uint8 * required).from_address(pointer)
+    rows = np.ctypeslib.as_array(mapped).reshape(height, stride)
+    pixels = rows[:, : width * 3].reshape(height, width, 3)
+    if image_format == AX_FORMAT_RGB888:  # B, G, R bytes.
+        coefficients = (29, 150, 77)
+    else:  # AX_FORMAT_BGR888: R, G, B bytes.
+        coefficients = (77, 150, 29)
+    # Convert one channel at a time: this avoids copying the mapped packed frame
+    # and avoids expanding all three channels to uint16 simultaneously.
+    gray16 = np.multiply(pixels[:, :, 0], coefficients[0], dtype=np.uint16)
+    gray16 += np.multiply(pixels[:, :, 1], coefficients[1], dtype=np.uint16)
+    gray16 += np.multiply(pixels[:, :, 2], coefficients[2], dtype=np.uint16)
+    gray16 += 128
+    np.right_shift(gray16, 8, out=gray16)
+    target = np.frombuffer(destination, dtype=np.uint8).reshape(height, width)
+    np.copyto(target, gray16[::-1] if bottom_up else gray16, casting="unsafe")
+
+
+def copy_packed_frame_to_rgb(
+    pointer: int,
+    width: int,
+    height: int,
+    stride: int,
+    image_format: int,
+    destination: bytearray,
+) -> None:
+    """Copy a mapped packed frame into a compact, top-down RGB8 buffer."""
+    row_bytes = width * 3
+    if (
+        width <= 0
+        or height <= 0
+        or stride < row_bytes
+        or len(destination) != row_bytes * height
+    ):
+        raise ValueError("invalid packed RGB frame or destination dimensions")
+    if image_format not in (AX_FORMAT_RGB888, AX_FORMAT_BGR888):
+        raise ValueError(
+            "RGB storage requires an AX RGB888/BGR888 packed source; "
+            f"received {FORMAT_NAMES.get(image_format, hex(image_format))}"
+        )
+
+    address = ctypes.addressof(ctypes.c_ubyte.from_buffer(destination))
+    if image_format == AX_FORMAT_BGR888:  # Vendor memory order is R, G, B.
+        if stride == row_bytes:
+            ctypes.memmove(address, pointer, row_bytes * height)
+        else:
+            for row in range(height):
+                ctypes.memmove(
+                    address + row * row_bytes, pointer + row * stride, row_bytes
+                )
+        return
+
+    # AX_FORMAT_RGB888 uses B,G,R byte order in memory.  Convert into the
+    # public RGB8 contract while the SDK mapping is still valid.
+    try:
+        import numpy as np
+    except ImportError:
+        for row in range(height):
+            source = pointer + row * stride
+            target = row * row_bytes
+            for column in range(width):
+                offset = column * 3
+                destination[target + offset] = ctypes.c_ubyte.from_address(
+                    source + offset + 2
+                ).value
+                destination[target + offset + 1] = ctypes.c_ubyte.from_address(
+                    source + offset + 1
+                ).value
+                destination[target + offset + 2] = ctypes.c_ubyte.from_address(
+                    source + offset
+                ).value
+        return
+
+    mapped = (ctypes.c_uint8 * (stride * height)).from_address(pointer)
+    rows = np.ctypeslib.as_array(mapped).reshape(height, stride)
+    source = rows[:, :row_bytes].reshape(height, width, 3)
+    target = np.frombuffer(destination, dtype=np.uint8).reshape(height, width, 3)
+    np.copyto(target, source[:, :, ::-1])
+
+
+def _load_libyuv() -> ctypes.CDLL | None:
+    """Load the board's existing libyuv without changing the environment."""
+    global _LIBYUV, _LIBYUV_LOAD_ATTEMPTED
+    if _LIBYUV_LOAD_ATTEMPTED:
+        return _LIBYUV
+    _LIBYUV_LOAD_ATTEMPTED = True
+    candidates = [ctypes.util.find_library("yuv"), "libyuv.so.0", "libyuv.so"]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            library = ctypes.CDLL(candidate)
+        except OSError:
+            continue
+        for name in ("NV12ToRAW", "NV21ToRAW"):
+            function = getattr(library, name, None)
+            if function is not None:
+                function.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                ]
+                function.restype = ctypes.c_int
+        _LIBYUV = library
+        return library
+    return None
+
+
+def _copy_yuv420_semiplanar_to_rgb_numpy(
+    pointer: int,
+    width: int,
+    height: int,
+    y_stride: int,
+    uv_stride: int,
+    image_format: int,
+    destination: bytearray,
+) -> None:
+    """BT.601 limited-range NV12/NV21 to compact top-down RGB8 fallback."""
+    try:
+        import numpy as np
+    except ImportError:
+        # Dependency-free fallback. It is intentionally simple; production
+        # boards normally use their existing libyuv, with NumPy as fallback.
+        uv_offset = y_stride * height
+        for row in range(height):
+            y_row = pointer + row * y_stride
+            uv_row = pointer + uv_offset + (row // 2) * uv_stride
+            target = row * width * 3
+            for column in range(width):
+                y_value = ctypes.c_ubyte.from_address(y_row + column).value
+                chroma = (column // 2) * 2
+                c0 = ctypes.c_ubyte.from_address(uv_row + chroma).value
+                c1 = ctypes.c_ubyte.from_address(uv_row + chroma + 1).value
+                if image_format == AX_FORMAT_YUV420_SEMIPLANAR:
+                    u_value, v_value = c0, c1
+                else:
+                    v_value, u_value = c0, c1
+                c = max(0, y_value - 16)
+                d = u_value - 128
+                e = v_value - 128
+                destination[target] = min(255, max(0, (298 * c + 409 * e + 128) >> 8))
+                destination[target + 1] = min(
+                    255, max(0, (298 * c - 100 * d - 208 * e + 128) >> 8)
+                )
+                destination[target + 2] = min(
+                    255, max(0, (298 * c + 516 * d + 128) >> 8)
+                )
+                target += 3
+        return
+
+    y_size = y_stride * height
+    uv_size = uv_stride * (height // 2)
+    mapped = (ctypes.c_uint8 * (y_size + uv_size)).from_address(pointer)
+    raw = np.ctypeslib.as_array(mapped)
+    y = raw[:y_size].reshape(height, y_stride)[:, :width].astype(np.int32)
+    uv = raw[y_size:y_size + uv_size].reshape(height // 2, uv_stride)[:, :width]
+    uv = uv.reshape(height // 2, width // 2, 2)
+    if image_format == AX_FORMAT_YUV420_SEMIPLANAR:
+        u_half, v_half = uv[:, :, 0], uv[:, :, 1]
+    else:
+        v_half, u_half = uv[:, :, 0], uv[:, :, 1]
+    u = np.repeat(np.repeat(u_half, 2, axis=0), 2, axis=1).astype(np.int32)
+    v = np.repeat(np.repeat(v_half, 2, axis=0), 2, axis=1).astype(np.int32)
+    c = np.maximum(y - 16, 0)
+    d = u - 128
+    e = v - 128
+    target = np.frombuffer(destination, dtype=np.uint8).reshape(height, width, 3)
+    target[:, :, 0] = np.clip((298 * c + 409 * e + 128) >> 8, 0, 255)
+    target[:, :, 1] = np.clip((298 * c - 100 * d - 208 * e + 128) >> 8, 0, 255)
+    target[:, :, 2] = np.clip((298 * c + 516 * d + 128) >> 8, 0, 255)
+
+
+def copy_yuv420_semiplanar_to_rgb(
+    pointer: int,
+    map_size: int,
+    width: int,
+    height: int,
+    y_stride: int,
+    uv_stride: int,
+    image_format: int,
+    destination: bytearray,
+) -> str:
+    """Convert an uncompressed NV12/NV21 frame into compact RGB8."""
+    if image_format not in (
+        AX_FORMAT_YUV420_SEMIPLANAR,
+        AX_FORMAT_YUV420_SEMIPLANAR_VU,
+    ):
+        raise ValueError("YUV420 conversion requires NV12 or NV21")
+    if (
+        width <= 0
+        or height <= 0
+        or width % 2
+        or height % 2
+        or y_stride < width
+        or uv_stride < width
+        or len(destination) != width * height * 3
+    ):
+        raise ValueError("invalid NV12/NV21 frame or destination dimensions")
+    required = y_stride * height + uv_stride * (height // 2)
+    if map_size < required:
+        raise ValueError(
+            f"NV12/NV21 frame buffer is truncated: {map_size} < {required}"
+        )
+
+    library = _load_libyuv()
+    function_name = (
+        "NV12ToRAW"
+        if image_format == AX_FORMAT_YUV420_SEMIPLANAR
+        else "NV21ToRAW"
+    )
+    function = getattr(library, function_name, None) if library is not None else None
+    if function is not None:
+        destination_pointer = ctypes.addressof(ctypes.c_ubyte.from_buffer(destination))
+        result = int(function(
+            ctypes.c_void_p(pointer),
+            y_stride,
+            ctypes.c_void_p(pointer + y_stride * height),
+            uv_stride,
+            ctypes.c_void_p(destination_pointer),
+            width * 3,
+            width,
+            height,
+        ))
+        if result != 0:
+            raise RuntimeError(f"libyuv {function_name} failed: {result}")
+        return "libyuv"
+
+    _copy_yuv420_semiplanar_to_rgb_numpy(
+        pointer, width, height, y_stride, uv_stride, image_format, destination
+    )
+    return "numpy_or_python"
+
+
+def copy_y_plane_to_rgb(
+    pointer: int,
+    width: int,
+    height: int,
+    stride: int,
+    destination: bytearray,
+) -> None:
+    """Expand a YUV400 frame to RGB8 without inventing colour."""
+    if width <= 0 or height <= 0 or stride < width or len(destination) != width * height * 3:
+        raise ValueError("invalid YUV400 frame or RGB destination dimensions")
+    try:
+        import numpy as np
+    except ImportError:
+        for row in range(height):
+            source = pointer + row * stride
+            target = row * width * 3
+            for column in range(width):
+                value = ctypes.c_ubyte.from_address(source + column).value
+                destination[target:target + 3] = bytes((value, value, value))
+                target += 3
+        return
+    mapped = (ctypes.c_uint8 * (stride * height)).from_address(pointer)
+    source = np.ctypeslib.as_array(mapped).reshape(height, stride)[:, :width]
+    target = np.frombuffer(destination, dtype=np.uint8).reshape(height, width, 3)
+    target[:] = source[:, :, None]
+
+
 def copy_y_plane(pointer: int, width: int, height: int, stride: int,
                  destination: bytearray, bottom_up: bool = False) -> None:
     """Copy mapped Y pixels once; no view of SDK memory escapes this function."""
@@ -851,7 +1172,7 @@ def copy_y_plane(pointer: int, width: int, height: int, stride: int,
 
 
 @dataclass(frozen=True)
-class GrayFrame:
+class ImageFrame:
     timestamp_ns: int
     sequence: int
     width: int
@@ -859,6 +1180,12 @@ class GrayFrame:
     pixels: bytes | bytearray
     source_format: int
     bottom_up: bool = False
+    encoding: str = "mono8"
+
+
+# Compatibility name for existing stereo/mono8 callers.  New single-camera
+# code uses ImageFrame because the same ownership object can now carry rgb8.
+GrayFrame = ImageFrame
 
 
 class IvpsGrabber:
@@ -904,10 +1231,7 @@ class IvpsGrabber:
         result = self.api.get_frame(self.grp, self.chn, self.timeout_ms, frame)
         if result != 0:
             self.stats["get_errors"] = int(self.stats["get_errors"]) + 1
-            raise RuntimeError(
-                f"AX_IVPS_GetChnFrame(grp={self.grp}, chn={self.chn}) failed: "
-                f"{ax_return_code_text(result)}"
-            )
+            raise IvpsGetFrameError(self.grp, self.chn, result)
         try:
             validate_frame_metadata(frame, self.expected_resolution, None)
             sequence = int(frame.u64SeqNum)
@@ -944,7 +1268,7 @@ class IvpsGrabber:
         release_after_copy: bool = False,
         buffer: bytearray | None = None,
         bottom_up: bool = False,
-    ) -> GrayFrame:
+    ) -> ImageFrame:
         width, height = int(frame.u32Width), int(frame.u32Height)
         if buffer is None:
             buffer = bytearray(width * height)
@@ -960,25 +1284,94 @@ class IvpsGrabber:
             stride = int(frame.u32PicStride[0])
             image_format = int(frame.enImgFormat)
             if image_format in (AX_FORMAT_RGB888, AX_FORMAT_BGR888):
-                raw = ctypes.string_at(pointer, stride * height)
-                gray = packed_frame_to_gray(raw, width, height, stride, image_format)
-                if bottom_up:
-                    for row in range(height):
-                        source = (height - 1 - row) * width
-                        buffer[row * width:(row + 1) * width] = gray[source:source + width]
-                else:
-                    buffer[:] = gray
+                copy_packed_frame_to_gray(
+                    pointer, width, height, stride, image_format, buffer, bottom_up
+                )
             else:
                 copy_y_plane(pointer, width, height, stride, buffer, bottom_up)
             self.timings.add("copy_y", time.perf_counter_ns() - started)
-            return GrayFrame(
-                timestamp_ns=int(frame.u64PTS) * 1000,
+            return ImageFrame(
+                # IVPS grp 3 USB producer already supplies u64PTS in nanoseconds.
+                timestamp_ns=int(frame.u64PTS),
                 sequence=int(frame.u64SeqNum),
                 width=width,
                 height=height,
                 pixels=buffer,
                 source_format=image_format,
                 bottom_up=bottom_up,
+                encoding="mono8",
+            )
+        finally:
+            try:
+                if pointer:
+                    started = time.perf_counter_ns()
+                    self.api.unmap_frame(pointer, map_size, mapped_here)
+                    self.timings.add("unmap", time.perf_counter_ns() - started)
+            finally:
+                if release_after_copy and getattr(frame, "_ivps_owned", False):
+                    self.release_frame(frame)
+
+    def copy_rgb_frame(
+        self,
+        frame: AxVideoFrame,
+        *,
+        release_after_copy: bool = False,
+        buffer: bytearray | None = None,
+    ) -> ImageFrame:
+        """Convert a supported IVPS source into reusable top-down RGB8 storage."""
+        width, height = int(frame.u32Width), int(frame.u32Height)
+        if buffer is None:
+            buffer = bytearray(width * height * 3)
+        if len(buffer) != width * height * 3:
+            raise ValueError("USB RGB image buffer size differs from frame resolution")
+        pointer = map_size = 0
+        mapped_here = False
+        try:
+            started = time.perf_counter_ns()
+            pointer, map_size, mapped_here = self.api.map_frame(frame)
+            self.timings.add("map_and_invalidate", time.perf_counter_ns() - started)
+            started = time.perf_counter_ns()
+            image_format = int(frame.enImgFormat)
+            stride = int(frame.u32PicStride[0])
+            if image_format in (AX_FORMAT_RGB888, AX_FORMAT_BGR888):
+                copy_packed_frame_to_rgb(
+                    pointer, width, height, stride, image_format, buffer
+                )
+                backend = "packed_copy"
+            elif image_format in (
+                AX_FORMAT_YUV420_SEMIPLANAR,
+                AX_FORMAT_YUV420_SEMIPLANAR_VU,
+            ):
+                uv_stride = int(frame.u32PicStride[1]) or stride
+                backend = copy_yuv420_semiplanar_to_rgb(
+                    pointer,
+                    map_size,
+                    width,
+                    height,
+                    stride,
+                    uv_stride,
+                    image_format,
+                    buffer,
+                )
+            elif image_format == AX_FORMAT_YUV400:
+                copy_y_plane_to_rgb(pointer, width, height, stride, buffer)
+                backend = "yuv400_expand"
+            else:
+                raise ValueError(
+                    "RGB storage supports NV12, NV21, YUV400, AX RGB888, or "
+                    f"AX BGR888; received {FORMAT_NAMES.get(image_format, hex(image_format))}"
+                )
+            self.stats["rgb_conversion_backend"] = backend
+            self.timings.add("copy_rgb", time.perf_counter_ns() - started)
+            return ImageFrame(
+                timestamp_ns=int(frame.u64PTS),
+                sequence=int(frame.u64SeqNum),
+                width=width,
+                height=height,
+                pixels=buffer,
+                source_format=image_format,
+                bottom_up=False,
+                encoding="rgb8",
             )
         finally:
             try:
@@ -1001,7 +1394,8 @@ class IvpsGrabber:
             "stride": int(frame.u32PicStride[0]),
             "frame_size": int(frame.u32FrameSize),
             "compress_mode": int(frame.stCompressInfo.enCompressMode),
-            "timestamp_us": int(frame.u64PTS),
+            "timestamp_ns": int(frame.u64PTS),
+            "pts_unit": "ns",
             "sequence": int(frame.u64SeqNum),
         }
 
@@ -1130,7 +1524,7 @@ class StereoGrabber:
         result = self.api.get_frame(pipe, chn, self.timeout_ms, frame)
         if result != 0:
             self.stats[f"get_{side}_errors"] += 1
-            raise RuntimeError(f"AX_VIN_GetYuvFrame({side}) failed: {ax_return_code_text(result)}")
+            raise VinGetFrameError(side, pipe, chn, result)
         self.acquisition_stats.acquired(side, int(frame.u64SeqNum))
         if self.sequence_window is not None:
             self.sequence_window.acquired(side, int(frame.u64SeqNum))

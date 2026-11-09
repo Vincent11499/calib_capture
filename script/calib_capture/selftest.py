@@ -23,7 +23,7 @@ from .axera import (
     inspect_sdk_headers,
     packed_frame_to_gray,
 )
-from .bmp import read_mono8_bmp, write_mono8_bmp
+from .bmp import read_mono8_bmp, read_rgb8_bmp, write_mono8_bmp, write_rgb8_bmp
 from .capture import FrameDivider, RateLimiter
 from .config import build_capture_config, DATASET_SCHEMA_VERSION
 from .dataset import DatasetWriter, ImuRecord
@@ -62,6 +62,19 @@ def run_self_test(sdk_include_dir: str = "") -> dict[str, Any]:
         _check((info.width, info.height) == (5, 3), "BMP dimensions changed")
         _check(decoded == pixels, "BMP pixels did not round-trip")
         tests.append("mono8_bmp_roundtrip")
+
+        rgb_pixels = bytes((255, 0, 0, 0, 255, 0,
+                            0, 0, 255, 255, 255, 255))
+        rgb_path = temp / "rgb.bmp"
+        write_rgb8_bmp(rgb_path, 2, 2, rgb_pixels)
+        rgb_info, rgb_decoded = read_rgb8_bmp(rgb_path)
+        _check(
+            (rgb_info.width, rgb_info.height, rgb_info.bits_per_pixel)
+            == (2, 2, 24),
+            "RGB BMP dimensions or bit depth changed",
+        )
+        _check(rgb_decoded == rgb_pixels, "RGB BMP pixels did not round-trip")
+        tests.append("rgb8_bmp_roundtrip")
 
         yuv = bytes((1, 2, 3, 9, 4, 5, 6, 9))
         for image_format in (

@@ -20,6 +20,7 @@ from .config import (
     CaptureConfig,
     build_capture_config,
     detect_sdk_include_dir,
+    load_ini_mapping,
     session_output_path,
 )
 from .ros1_export import export_ros1_bag
@@ -55,9 +56,7 @@ def _add_capture_options(
     parser.add_argument("--right-pipe", type=int, default=None)
     parser.add_argument("--right-chn", type=int, default=None)
     parser.add_argument("--resolution", default=None, metavar="WIDTHxHEIGHT")
-    parser.add_argument("--image-format", choices=("bmp", "jpeg"), default=None)
     parser.add_argument("--image-workers", type=int, default=None, help="image worker threads, 1..8 (default: 2)")
-    parser.add_argument("--jpeg-quality", type=int, default=None, help="JPEG quality 1..100 (default: 95)")
     parser.add_argument("--expected-source-rate-hz", type=float, default=None)
     if continuous:
         rate_control = parser.add_mutually_exclusive_group()
@@ -80,7 +79,10 @@ def _add_capture_options(
                 "0 disables frame division and uses --save-rate-hz"
             ),
         )
-    parser.add_argument("--duration-s", type=float, default=None)
+    parser.add_argument(
+        "--duration-s", type=float, default=None,
+        help="recording seconds; omit in continuous camera modes to stop with Ctrl+C",
+    )
     if include_poses:
         parser.add_argument("--poses", type=int, default=None)
     parser.add_argument("--sync-tolerance-us", type=int, default=None)
@@ -104,9 +106,11 @@ def _add_usb_options(parser: argparse.ArgumentParser, *, continuous: bool) -> No
     parser.add_argument("--dataset-name", default=None)
     parser.add_argument("--ax-lib-dir", default=None)
     parser.add_argument("--sdk-include-dir", default=None)
-    parser.add_argument("--image-format", choices=("bmp", "jpeg"), default=None)
+    parser.add_argument(
+        "--pixel-format", choices=("rgb", "mono8"), default=None,
+        help="stored pixels (default: rgb; use mono8 for grayscale)",
+    )
     parser.add_argument("--image-workers", type=int, default=None)
-    parser.add_argument("--jpeg-quality", type=int, default=None)
     parser.add_argument("--capture-timeout-ms", type=int, default=None)
     parser.add_argument("--writer-queue-pairs", type=int, default=None,
                         help="bounded USB image queue capacity (default: 2)")
@@ -116,7 +120,10 @@ def _add_usb_options(parser: argparse.ArgumentParser, *, continuous: bool) -> No
             "--save-rate-hz", "--rate-hz", dest="save_rate_hz", type=float, default=None,
             help=f"target USB image rate by PTS (default: {DEFAULTS['save_rate_hz']:g} Hz)",
         )
-        parser.add_argument("--duration-s", type=float, default=None)
+        parser.add_argument(
+            "--duration-s", type=float, default=None,
+            help="recording seconds; omit to stop cleanly with Ctrl+C",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -169,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     usb_continuous = subparsers.add_parser(
         USB_CONTINUOUS_MODE,
-        help="single USB camera capture from IVPS grp 3/chn 0 at fixed 1920x1080",
+        help="single USB camera capture from IVPS grp 3/chn 0 at fixed 1280x960",
     )
     _add_usb_options(usb_continuous, continuous=True)
 
@@ -223,6 +230,16 @@ def _capture_config(args: argparse.Namespace, mode: str) -> CaptureConfig:
         config_path=args.config,
         overrides=overrides,
     )
+    indefinite_modes = {"stereo-continuous", STEREO_IMU_MODE, USB_CONTINUOUS_MODE}
+    if (
+        mode in indefinite_modes
+        and values.get("duration_s") is None
+        and "duration_s" not in load_ini_mapping(args.config)
+    ):
+        # For continuous camera modes, omitting the duration means that the
+        # operator owns the stop condition.  An INI duration remains a real
+        # configured limit and an explicit CLI value still has top priority.
+        config = replace(config, duration_s=None)
     if mode in {STEREO_BASELINK_MODE, USB_BASELINK_MODE}:
         config = replace(config, poses=len(BASE_LINK_POSES))
     if mode in {

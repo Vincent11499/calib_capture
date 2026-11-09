@@ -14,6 +14,7 @@ from .axera import (
     AX_FORMAT_YUV420_SEMIPLANAR,
     AxVinApi,
     StereoGrabber,
+    VinGetFrameError,
     assert_ctypes_abi,
 )
 from .bmp import BMP_PIXEL_OFFSET
@@ -140,17 +141,19 @@ class ImuSubscriber:
         self,
         config: CaptureConfig,
         callback: Callable[[ImuRecord], bool | None] | None = None,
-        *, temperature_callback: Callable[[Any], None] | None = None,
-        allow_non_increasing_timestamps: bool = False,
+        *,
+        temperature_callback: Callable[[Any], None] | None = None,
+        timestamp_error_callback: Callable[[ImuRecord, ImuRecord], None] | None = None,
     ) -> None:
         self.config = config
         self.callback = callback
         self.temperature_callback = temperature_callback
-        self.allow_non_increasing_timestamps = allow_non_increasing_timestamps
+        self.timestamp_error_callback = timestamp_error_callback
         self.records: list[ImuRecord] = []
         self.count = 0
         self.first_timestamp_ns: int | None = None
         self.last_timestamp_ns: int | None = None
+        self.last_record: ImuRecord | None = None
         self.first_event = threading.Event()
         self.stop_event = threading.Event()
         self.error: BaseException | None = None
@@ -241,11 +244,13 @@ class ImuSubscriber:
                     if record.timestamp_ns <= 0:
                         raise ValueError("IMU header timestamp is zero or negative")
                     if (
-                        not owner.allow_non_increasing_timestamps
-                        and owner.last_timestamp_ns is not None
+                        owner.last_timestamp_ns is not None
                         and record.timestamp_ns <= owner.last_timestamp_ns
                     ):
                         delta_ns = record.timestamp_ns - owner.last_timestamp_ns
+                        if owner.timestamp_error_callback is not None:
+                            assert owner.last_record is not None
+                            owner.timestamp_error_callback(owner.last_record, record)
                         raise ValueError(
                             "IMU header timestamp is not strictly increasing: "
                             f"previous={owner.last_timestamp_ns}, current={record.timestamp_ns}, "
@@ -260,6 +265,7 @@ class ImuSubscriber:
                         owner.records.append(record)
                     owner.count += 1
                     owner.last_timestamp_ns = record.timestamp_ns
+                    owner.last_record = record
                     if owner.first_timestamp_ns is None:
                         owner.first_timestamp_ns = record.timestamp_ns
                         owner.first_event.set()
@@ -356,6 +362,31 @@ def _warmup_pair(grabber: StereoGrabber, *, bottom_up: bool = False) -> tuple[di
     finally:
         if not frames.released:
             grabber.release_frames(frames)
+
+
+def _grab_frames_or_stop(
+    grabber: StereoGrabber,
+    interrupts: _CaptureInterrupts,
+    stats: dict[str, Any],
+):
+    """Finish cleanly when SIGINT makes a blocking VIN get return an error."""
+    try:
+        return grabber.grab_frames()
+    except VinGetFrameError as error:
+        if not interrupts.count:
+            raise
+        # A second Ctrl+C still cancels safe drain/post-roll. The first signal
+        # can make a blocking SDK call return before the loop sees the request.
+        interrupts.check()
+        stats["operator_stop_get_error"] = {
+            "call": "AX_VIN_GetYuvFrame",
+            "side": error.side,
+            "pipe": error.pipe,
+            "chn": error.chn,
+            "result": error.result,
+            "result_hex": error.result_hex,
+        }
+        return None
 
 
 def _check_startup_clock(
@@ -514,20 +545,28 @@ def _record_continuous(
 ) -> tuple[Path, ValidationReport]:
     if not config.output:
         raise ValueError("--output is required")
-    estimated_pairs = config.duration_s * config.target_save_rate_hz
+    estimated_pairs = (
+        None if config.duration_s is None
+        else config.duration_s * config.target_save_rate_hz
+    )
     rate_description = (
         f"one pair per {config.frame_divisor} synchronized source pairs "
         f"(~{config.target_save_rate_hz:g} Hz at the expected source rate)"
         if config.frame_divisor > 0
         else f"PTS rate limit {config.save_rate_hz:g} Hz"
     )
-    print(
-        f"Uncompressed stereo BMP equivalent using {rate_description}: "
-        f"{_estimated_stereo_gb(config, estimated_pairs):.2f} GB. "
-        "No free-space or write-speed preflight is performed."
-    )
-    if config.image_format == "jpeg":
-        print(f"Saving grayscale JPEG quality={config.jpeg_quality} (lossy); actual size depends on image content.")
+    if estimated_pairs is None:
+        print(
+            f"Continuous stereo capture using {rate_description}; "
+            "press Ctrl+C to stop cleanly. "
+            "No free-space or write-speed preflight is performed."
+        )
+    else:
+        print(
+            f"Uncompressed stereo BMP equivalent using {rate_description}: "
+            f"{_estimated_stereo_gb(config, estimated_pairs):.2f} GB. "
+            "No free-space or write-speed preflight is performed."
+        )
     dataset = DatasetWriter(config.output, config, include_imu)
     api: AxVinApi | None = None
     grabber: StereoGrabber | None = None
@@ -558,7 +597,7 @@ def _record_continuous(
             imu.wait_first(config.startup_timeout_s, lambda: interrupts.check(before_camera=True))
 
         interrupts.check(before_camera=True)
-        warmup, warmup_timestamp = _warmup_pair(grabber, bottom_up=config.image_format == "bmp")
+        warmup, warmup_timestamp = _warmup_pair(grabber, bottom_up=True)
         previous_left_ns = int(warmup["left"]["timestamp_us"]) * 1000
         previous_right_ns = int(warmup["right"]["timestamp_us"]) * 1000
         interrupts.check(before_camera=True)
@@ -583,18 +622,28 @@ def _record_continuous(
         limiter = None if divider is not None else RateLimiter(config.save_rate_hz)
         capture_started = time.monotonic()
         capture_cpu_started = time.process_time()
-        deadline = capture_started + config.duration_s
+        deadline = (
+            None if config.duration_s is None
+            else capture_started + config.duration_s
+        )
         # Exclude warmup, preroll and the transition into the image window.
         grabber.start_sequence_window()
+        print(
+            f"Ready: {config.width}x{config.height} mono8 BMP, "
+            f"VIN left pipe {config.left_pipe}/chn {config.left_chn}, "
+            f"right pipe {config.right_pipe}/chn {config.right_chn}."
+        )
         try:
-            while time.monotonic() < deadline:
+            while deadline is None or time.monotonic() < deadline:
                 interrupts.check()
                 if interrupts.count:
                     break
                 if imu is not None:
                     imu.raise_if_failed()
                 pair_writer.raise_if_failed()
-                frames = grabber.grab_frames()
+                frames = _grab_frames_or_stop(grabber, interrupts, stats)
+                if frames is None:
+                    break
                 try:
                     interrupts.check()
                     if interrupts.count:
@@ -625,7 +674,7 @@ def _record_continuous(
                     try:
                         gray_pair = grabber.copy_gray_pair(
                             frames, release_after_copy=True, buffers=slot,
-                            bottom_up=config.image_format == "bmp")
+                            bottom_up=True)
                         if pair_writer.submit(gray_pair, slot):
                             slot = None  # Ownership transferred to the writer.
                         else:
@@ -750,9 +799,8 @@ def record_triggered(
     try:
         api = AxVinApi(config.ax_lib_dir, config.sdk_include_dir)
         grabber = _make_grabber(api, config)
-        warmup, _ = _warmup_pair(grabber, bottom_up=config.image_format == "bmp")
-        storage = (f"JPEG quality={config.jpeg_quality} (lossy)"
-                   if config.image_format == "jpeg" else "mono8 BMP")
+        warmup, _ = _warmup_pair(grabber, bottom_up=True)
+        storage = "mono8 BMP"
         print(
             f"Ready: {config.width}x{config.height} {storage}, "
             f"VIN left pipe {config.left_pipe}/chn {config.left_chn}, "
@@ -780,7 +828,7 @@ def record_triggered(
             try:
                 stats["source_pairs"] += 1
                 pair = grabber.copy_gray_pair(frames, release_after_copy=True,
-                                              buffers=buffers, bottom_up=config.image_format == "bmp")
+                                              buffers=buffers, bottom_up=True)
             finally:
                 if not frames.released:
                     grabber.release_frames(frames)

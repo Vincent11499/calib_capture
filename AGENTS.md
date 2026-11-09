@@ -37,9 +37,9 @@
 | cali | VIN | pipe 2 / chn 0 | pipe 0 / chn 0 | `AX_VIN_GetYuvFrame` | NV12；3840×2160 或 1920×1080 |
 | vis | VIN | pipe 2 / chn 0 | pipe 0 / chn 0 | `AX_VIN_GetYuvFrame` | NV12，3840×2160 |
 | vis | IVPS | grp 7 / chn 0 | grp 8 / chn 0 | `AX_IVPS_GetChnFrame` | YUV400，640×384 |
-| usb | IVPS | grp 3 / chn 0 | — | `AX_IVPS_GetChnFrame` | 固定 1920×1080，落盘 mono8 |
+| usb | IVPS | grp 3 / chn 0 | — | `AX_IVPS_GetChnFrame` | 固定 1280×960、源 30 Hz；默认 rgb8 24-bit BMP，可选 mono8 |
 
-双目正式标定只使用 cali VIN。不得将 vis 的 640×384 IVPS 图像用于双目标定录制。USB 命令只读 grp 3/chn 0 且严格校验 1920×1080，不提供分辨率覆盖。`--resolution` 只用于 VIN 命令校验上游实际输出，不得修改相机 config、重配 VIN/IVPS 或缩放图像。
+双目正式标定只使用 cali VIN。不得将 vis 的 640×384 IVPS 图像用于双目标定录制。USB 命令只读 grp 3/chn 0 且严格校验 1280×960，不提供分辨率覆盖。`--resolution` 只用于 VIN 命令校验上游实际输出，不得修改相机 config、重配 VIN/IVPS 或缩放图像。
 
 ## 采集契约
 
@@ -50,17 +50,20 @@
 - `usb-continuous` 和 `usb-baselink-triggered` 是单相机模式，只创建 `cam0` 和 `meta/frames.csv`，不得复制同一图像伪造 `cam1`。后者沿用相同 14 姿态及姿态文件名；前者只用 PTS `--save-rate-hz`（别名 `--rate-hz`）限频。
 - USB 成功取帧后必须使用同一 grp/chn 和同一 `AX_VIDEO_FRAME_T` 调用 `AX_IVPS_ReleaseChnFrame`，每帧严格释放一次。编码线程不得持有 IVPS 帧或映射。
 - 默认左目 pipe 2/chn 0、右目 pipe 0/chn 0，CLI 可显式覆盖。
-- 标定输入必须为 NV12，落盘默认无损 `mono8` BMP；可配置 `image_format = jpeg`、`jpeg_quality = 95` 保存有损灰度 JPG。质量范围 1–100；JPEG 只使用 OpenCV/NumPy，不使用 Pillow，不自动安装板端依赖，不缩放图像。
+- VIN 标定输入必须为 NV12，落盘固定为无损 `mono8` BMP。USB 默认 `pixel_format = rgb` 和 24-bit BMP，可用 `--pixel-format mono8` 改为灰度 BMP。板端采集不加载 OpenCV、不缩放图像；PC 端 `raw_to_png.py` 的 RAW 去马赛克仍独立使用 OpenCV。
 - 数据文件不计算 SHA-256，录制、结束收尾、离线校验和 bag 导出都只做结构与时序检查。BMP 按原 bottom-up 布局大块写入；不生成 `meta/checksums.sha256`。SDK 启动契约哈希不属于逐帧数据处理，仍保留。
-- 使用 `u64PhyAddr[0]` 调用 `AX_SYS_MmapCache`；缓存失效后直接复制有效 Y 平面到 Python 自有缓冲区，再立即 Munmap 并释放 SDK 帧。BMP 在复制时形成 bottom-up 行序，JPEG 保持 top-down。不得解引用其他进程的 `u64VirAddr`，不得让 SDK 映射或帧进入编码线程。
+- 使用 `u64PhyAddr[0]` 调用 `AX_SYS_MmapCache`；缓存失效后复制到 Python 自有缓冲区，再立即 Munmap 并释放 SDK 帧。VIN/USB mono8 对 YUV 源复制有效 Y、对 packed RGB/BGR 计算亮度；USB RGB 自动兼容 NV12/NV21、YUV400 和 packed RGB/BGR，统一形成紧凑 top-down RGB8，BMP 的 RGB→BGR 排列在图像线程完成。NV12/NV21 优先调用板端已有 libyuv，缺失时才用 NumPy／标准库回退，不安装依赖。不得解引用其他进程的 `u64VirAddr`，不得让 SDK 映射或帧进入编码线程。
 - `AX_VIN_GetYuvFrame` 获取完整 `AX_IMG_INFO_T`，必须把同一个对象交回原 pipe/chn 的 `AX_VIN_ReleaseYuvFrame`。每个成功获取的帧只释放一次。
 - 左右 PTS 差默认不超过 200 µs（含边界）；超限时仅重取较早侧，最多 10 次。
-- 相机时间戳使用各自 `u64PTS × 1000` ns；IMU 使用原始 `header.stamp`。
+- VIN 双目时间戳使用各自 `u64PTS × 1000` ns（VIN PTS 单位为 µs）；USB IVPS grp 3 的 `u64PTS` 已是 ns，必须原值保存，不得再次乘 1000。IMU 使用原始 `header.stamp`。
 - `stereo-imu` 默认在图像窗口前、后各保存至少 1 秒 IMU，分别由 `imu_preroll_s`、`imu_postroll_s` 控制；`duration_s` 只表示图像采集窗口，不包含 IMU 前后滚、排空和校验。按传感器时间戳核验覆盖，不得用睡眠时长假定已有足够数据。
 - IMU 非空原始 `header.frame_id` 优先；空值才使用配置 `imu_frame_id` 回退并告警。`ImuRecord.frame_id` 与 JSONL `frame_id` 始终保留原始字符串（包括空串），有效坐标系单独保存在 session 和内部 manifest，导出 bag 时才对空值应用回退。会话内有效坐标系变化必须失败，不得改写六轴数值或伪造原始坐标系。
 - 相机与 IMU 在同一启动阶段的参照时间戳差超过 5 秒时拒绝 `stereo-imu` 录制，不能把主动前滚造成的首张保存图像延后当成时钟偏移。
 - 连续采集按完整双目对限频、分频和入队；任何丢弃都必须同时丢弃左右目。
 - `--save-rate-hz` 与 `--frame-divisor N` 仅用于连续双目和 `stereo-imu`，两者互斥。默认按 PTS 保存双目 5 Hz（约 200 ms 一对）；可显式使用源序号分频。IMU 收到的消息全部保存。`usb-continuous` 仅用 `--save-rate-hz/--rate-hz`，不支持源序号分频。
+- `stereo-continuous`、`stereo-imu` 和 `usb-continuous` 省略 `--duration-s`（且 INI 未配置 `duration_s`）时持续采集，由第一次 Ctrl+C 正常停止并排空写盘队列；显式正数仍按时结束。`stereo-imu` 第一次中断还必须完成 IMU 尾采，第二次中断保留失败现场。
+- USB 第一次 Ctrl+C 可能使正在阻塞的 `AX_IVPS_GetChnFrame` 返回非零值。仅当中断请求已经到达时，脚本才把该返回值记录到 session 后按正常停止处理；没有 Ctrl+C 的相同 SDK 错误必须保持硬失败，第二次 Ctrl+C 也必须保留失败现场。
+- VIN 连续模式对阻塞中的 `AX_VIN_GetYuvFrame` 使用同一规则：进入图像窗口后打印 `Ready:`；首次 Ctrl+C 导致的取帧返回码记录为 `capture_stats.operator_stop_get_error` 并正常排空，未收到中断的同类错误仍为硬失败。`Ready:` 之前中断或尚未保存任何图像时不能提交有效数据集。
 - PTS 限频以首对时间锚定目标时刻，选择到达目标的第一对，避免周期舍入累计导致边界多跳一帧。
 - 采集先写 `.inprogress`，成功校验后提交正式目录；失败时保留为 `.failed`。
 
@@ -72,7 +75,7 @@
 <output>/<dataset_name>_YYMMDD_hhmm/
 ```
 
-目录名使用运行设备本地时间。前缀可由 CLI `--dataset-name` 或 INI `dataset_name` 指定；空 INI 值按模式选择 `stereo`、`stereo_base_link`、`stereo_imu`、`usb`、`usb_baselink` 或 `imu`。显式前缀为 1–64 个 ASCII 字母、数字、下划线或连字符，首字符是字母或数字。相同前缀同一分钟目录已存在时必须报错，包含 `.inprogress`、`.failed` 状态，不追加秒数或覆盖。实际会话目录及固定 `dataset_id` 写入命令输出与 session。
+目录名使用运行设备本地时间。前缀可由 CLI `--dataset-name` 或 INI `dataset_name` 指定；空 INI 值按模式选择 `stereo`、`stereo_base_link`、`stereo_imu`、`usb`、`usb_base_link` 或 `imu`。显式前缀为 1–64 个 ASCII 字母、数字、下划线或连字符，首字符是字母或数字。相同前缀同一分钟目录已存在时必须报错，包含 `.inprogress`、`.failed` 状态，不追加秒数或覆盖。实际会话目录及固定 `dataset_id` 写入命令输出与 session。
 
 ## ABI 基线
 
@@ -99,14 +102,15 @@
 - 内部采集信息写入 `meta/capture_dataset.yaml`，使用同一字符串版本和 `kind: capture_dataset`。session 使用 `kind: capture_session`、`dataset_manifest: kalibr_directory_dataset`、`capture_layout: compact`。联合采集只写一份 `imu/imu0.csv`，表头为 `timestamp_ns,wx,wy,wz,ax,ay,az`，根直接引用；不交换轴、不变号、不缩放。纯双目不创建 IMU 文件，根使用 `imus: []`。
 - Kalibr 不使用的辅助文件统一放 `meta/`，包括 `capture_dataset.yaml`、`pairs.csv`、`session.json`、`validation.json`；联合采集的 `imu_full.jsonl` 保留完整原消息，供 bag 导出，不是第二份标定 CSV。
 - 历史采集 schema 1/2/3 和旧双 CSV 布局明确拒绝；新格式缺少 metadata 或 IMU CSV/JSONL 也是硬错误。核对 manifest、session、CSV/JSONL 的身份、单位、路径、时间戳和六轴内容，不能修改历史文件规避不兼容。
-- 内部 manifest 记录 image_format、jpeg_quality 和 lossy，不使用数据校验和清单。JPEG 检查首尾标志并完整解码、核验单通道和尺寸，不保证发现所有可解码的像素损坏。bag 导出使用解码后的 mono8，不能恢复 JPEG 压缩前像素。
-- `image_workers`／`--image-workers` 默认 2，允许 1–8，BMP/JPEG 共用一个复用线程池。每图一个任务，同时处理最多 `ceil(image_workers/2)` 对；协调线程按提交顺序成对提交文件和 CSV。
+- 内部 manifest 记录 image_format、pixel_format 和 encoding，不使用数据校验和清单。RGB BMP 检查 24-bit top-down 标准布局、尺寸和长度；mono8 BMP 检查调色板、尺寸和长度。bag 导出只支持 VIN 双目数据，使用 BMP 中的 mono8。
+- `image_workers`／`--image-workers` 默认 2，允许 1–8，BMP 写盘共用一个复用线程池。每图一个任务，同时处理最多 `ceil(image_workers/2)` 对；协调线程按提交顺序成对提交文件和 CSV。
 - 默认等待队列容量 2 对。缓冲池按需分配，容量为等待队列 + 同时处理对数 + 1 个生产者槽位；满时在映射前整对丢弃。成功入队才转移缓冲所有权，所有成功/失败任务结束后才能归还，禁止无限积压。
 - CSV/IMU JSONL 每 0.5 秒批量刷新，正常停止和可处理异常退出时最终刷新，不逐帧 fsync。进程强杀或断电可能丢失尚未刷新的记录；后台刷新异常必须传播为录制失败。
 - `write_performance` 保留每对从图像任务提交到有序提交完成的延迟统计；包含线程池/顺序等待，不包含输入等待队列、取帧或 fsync。多对重叠时累计延迟不是总录制时间。`capture_stages`、`image_stages`、`capture_stats.pipeline` 分别记录取帧/复制、编码/写入/元数据、排队/容量/排空；另记录峰值 RSS 和校验时间。统计只用固定大小累计计数器。
 - 仅 `stereo-imu`、`imu-continuous` 和 `probe --with-imu` 可以依赖 ROS 2 Python 环境；USB 两个命令不依赖 ROS 2。
-- `imu-continuous` 为独立 IMU 原始诊断 CSV 采集，不调用 AX API、不要求相机或图像编码库。生成 `imu/imu0.csv`、`meta/imu_timestamp_anomalies.jsonl`、`meta/session.json` 和 `meta/validation.json`，session 使用字符串版本 `1.0.0`、`kind: imu_capture_session`、`capture_layout: imu_allan_csv`。此模式不生成双目 Kalibr manifest，不支持现有 ROS1 导出。六轴、原始 header stamp 和回调到达顺序保持不变；时间重复/回退不再中止，必须保留全部行、写异常前后记录并在 validation/session 中告警。含非递增时间戳的数据不得直接进入 Allan/Kalibr，分析工具仍应拒绝。非有限值、非正/越界时间戳、有效 frame ID 变化或停流仍为失败。默认 60 秒，不使用图像限频或 IMU 前后滚。第一条消息后开始计时，Ctrl+C 可提前正常收尾；不足两条样本或致命异常保留 `.failed`。`stereo-imu` 仍严格拒绝任何 IMU 时间重复/回退，不能把诊断采集的宽容策略扩展到标定数据。
+- `imu-continuous` 为独立 IMU 原始诊断 CSV 采集，不调用 AX API、不要求相机或图像编码库。生成 `imu/imu0.csv`、`meta/imu_timestamp_anomalies.jsonl`、`meta/session.json` 和 `meta/validation.json`，session 使用字符串版本 `1.0.0`、`kind: imu_capture_session`、`capture_layout: imu_allan_csv`。此模式不生成双目 Kalibr manifest，不支持现有 ROS1 导出。六轴、原始 header stamp 和回调到达顺序保持不变；与 `stereo-imu` 一样严格拒绝任何时间戳重复或回退。首个异常样本不得写入正式 CSV；必须把上一条已接受样本、当前被拒绝样本、时间差和六轴值写入异常 JSONL，立即中止并保留 `.failed`。session 记录严格策略、异常日志路径和数量，validation 将非空异常日志判为硬失败。非有限值、非正/越界时间戳、有效 frame ID 变化或停流也为失败。默认 60 秒，不使用图像限频或 IMU 前后滚。第一条消息后开始计时，Ctrl+C 可提前正常收尾；不足两条样本或致命异常保留 `.failed`。
 - PC 容器工具统一放 `script/imu_utils_docker/`：构建配置和补丁放 `docker/`，分析脚本放 `allan/`；仅 allan 子目录只读挂载到 `/scripts`，Compose 命令从 docker 子目录执行。输入根为 `data/allan_variance/data/`（只读），输出根为 `data/allan_variance/imu_utils_output/`；板端同步时排除 `script/imu_utils_docker/`。ROS1 `imu_utils` 仅作为 PC 外部交叉分析，不扩展项目 `export-ros1` 对独立 IMU 会话的支持范围。必须只读原始会话，把派生 bag、TXT/YAML/PNG、日志和报告写入独立的 `data/allan_variance/imu_utils_output/<会话名>/`；不得给该 bag 写 `ros1_export_result` 或改动 v1.0.0 数据契约。派生消息保持 `timestamp_ns`、六轴、单位、轴序和有效 frame ID，Header stamp 等于 record time，无姿态时显式标记未知；不得从沿用温度值伪造温度消息。
+- 纯 Python `allan_variance_ros` 兼容实现放在 `script/imu/allan/`，直接读取严格八列 CSV，不创建 bag，也不依赖 ROS、C++、Docker、PyYAML 或 AllanTools。兼容目标固定为上游提交 `1d54b602ee7f2ba0427865d63afe4945d913ed24`，必须保持其 0.1–999.9 s 网格、非重叠分箱及 `floor((N-1)/m)` 边界、陀螺仪 deg/s 中间单位、固定斜率拟合和三轴最大值聚合。默认输出根为 `data/allan_variance/allan_variance_output/`，原始输入只读，结果用 `.inprogress` 原子提交且不覆盖。板端同步时排除该 PC 分析目录。
 - `imu_utils` 派生 bag 必须全量回读，核对 topic、类型、数量、时间和六轴；回放后六轴 `numData` 必须全部等于 bag 消息数。丢消息结果只能进入 `diagnostic_*`，不能作为最终参数；图像和报告只从验证通过的最终目录生成。上游 `gyr_w/acc_w` 是 bias instability 最低值，不得直接映射为 Kalibr bias random walk。
 - 写盘队列满时只丢弃完整双目对，并记录 AX 错误、源序号缺口、分频/限频跳过数及队列丢弃数。
 - 独立 `imu-continuous` 默认另订阅 `imu_temperature_topic`（默认 `/imu/temperature`，sensor_msgs/msg/Temperature），其 CSV 为 `timestamp_ns,wx,wy,wz,ax,ay,az,temperature`，温度为摄氏度。按回调接收顺序沿用最新温度，不做按 header 时间戳匹配或插值；variance 不使用，允许 NaN，temperature 本身必须有限。首条温度前跳过 IMU 并统计预热数，首条可保存 IMU 后计时，等待超时失败。温度不更新时继续沿用，超过 2 秒告警。设备不发布温度时可显式使用 `--ignore-temperature`（INI 为 `use_temperature = false`），不创建温度订阅、不等待温度，独立 CSV 使用七列 `timestamp_ns,wx,wy,wz,ax,ay,az`，session 明确记录 `temperature.enabled=false`；不得伪造温度值。不改变 stereo-imu 的七列 CSV。
@@ -150,7 +154,7 @@ python3 -m unittest discover -s tests -v
 
 涉及 ABI、映射、同步、释放、分频或数据格式时，必须覆盖对应无硬件测试。安装 `rosbags==0.11.0` 后，ROS1 bag 生成与回读测试不得跳过。没有执行的可选依赖测试或板端测试必须明确说明。
 
-目录契约改动还需用可用的真实 `kalibr_bag_io.directory.DirectoryReader` 读取小型 BMP/JPEG 测试数据，检查自定义话题、数量、解码、身份和原始 IMU 数值；缺少该 reader 时明确跳过。两工程联动按用户授权修改代码，不运行实际标定或改变历史数据来代替契约测试。
+目录契约改动还需用可用的真实 `kalibr_bag_io.directory.DirectoryReader` 读取小型 BMP 测试数据，检查自定义话题、数量、解码、身份和原始 IMU 数值；缺少该 reader 时明确跳过。两工程联动按用户授权修改代码，不运行实际标定或改变历史数据来代替契约测试。
 
 板端验收至少检查：
 
@@ -162,7 +166,7 @@ python3 -m unittest discover -s tests -v
 
 ## 板端访问
 
-除非用户在当前任务明确授权，不得执行 SSH、SCP、`docker exec`、部署或板端运行。停止进程、切换相机模式或修改 Docker/系统配置需要单独授权。
+除非用户在当前任务明确授权，不得执行 SSH、SCP、部署或板端运行。后续所有板端均视为没有 Docker：不得查找、创建或使用容器，也不得通过 `docker exec`、宿主机目录映射等方式运行。停止进程、切换相机模式或修改板端系统配置需要单独授权。
 
 获得授权后的入口：
 
@@ -176,7 +180,7 @@ export ROS_DOMAIN_ID=93
 source /opt/ros/humble/setup.bash
 ```
 
-当前板端直接运行，无 Docker 或宿主机目录映射。`/root/.bashrc` 已设置 `ROS_DOMAIN_ID=93` 并 source ROS 2，交互登录通常无需重复设置；非交互 SSH 命令必须显式提供等效环境。板端只同步 `script/`；不要同步 `doc/`、顶层 `AGENTS.md`、`data/` 或 `tmp/`。板端使用现有环境，不安装新包或库；`requirements-capture.txt` 中的 NumPy 仅用于可选加速。ROS1 bag 导出和 `rosbags` 依赖只在 PC 本机使用。
+板端工作根目录固定为 `/workspace/minsky/Vincent`，项目目录固定为 `/workspace/minsky/Vincent/calib_capture`，直接在该目录运行，无 Docker 或宿主机目录映射。`/root/.bashrc` 已设置 `ROS_DOMAIN_ID=93` 并 source ROS 2，交互登录通常无需重复设置；非交互 SSH 命令必须显式提供等效环境。板端只同步 `script/`；不要同步 `doc/`、顶层 `AGENTS.md`、`data/` 或 `tmp/`。板端使用现有环境，不安装新包或库；`requirements-capture.txt` 中的 NumPy 仅用于可选加速。ROS1 bag 导出和 `rosbags` 依赖只在 PC 本机使用。
 
 ROS1 imu_utils 外部工具按用户最新要求只读取八列 imu/imu0.csv，不要求或读取 meta/session.json、meta/validation.json；帧名由 --frame-id 指定（默认 imu_link），不声称恢复原始 frame ID。此项覆盖前述外部 bag 保持有效 frame ID 的默认要求，不改变采集端契约。已移除 test_workflow.py；保留 CSV 必要读取检查、bag 回读与分析输出检查。
 

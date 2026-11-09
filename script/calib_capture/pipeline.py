@@ -8,7 +8,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
-from .axera import GrayFrame, GrayPair
+from .axera import GrayPair, ImageFrame
 from .dataset import DatasetWriter, PendingFrame, PendingPair
 from .performance import Timings
 
@@ -210,7 +210,7 @@ class FrameBufferPool:
 
 @dataclass
 class _FrameWork:
-    frame: GrayFrame
+    frame: ImageFrame
     slot: bytearray | None
     submitted_ns: int
 
@@ -222,8 +222,9 @@ class FrameDiskWriter:
         self.dataset = dataset
         self.max_active = dataset.config.image_workers
         self.queue: queue.Queue[_FrameWork] = queue.Queue(maxsize=capacity)
+        channels = 3 if dataset.config.pixel_format == "rgb" else 1
         self.pool = FrameBufferPool(
-            dataset.config.width * dataset.config.height,
+            dataset.config.width * dataset.config.height * channels,
             capacity + self.max_active + 1,
         )
         self.error: BaseException | None = None
@@ -241,7 +242,7 @@ class FrameDiskWriter:
         self.raise_if_failed()
         return None if self.queue.full() else self.pool.acquire()
 
-    def submit(self, frame: GrayFrame, slot: bytearray | None = None) -> bool:
+    def submit(self, frame: ImageFrame, slot: bytearray | None = None) -> bool:
         self.raise_if_failed()
         if self._finish_started:
             raise RuntimeError("image writer is stopping")

@@ -15,7 +15,6 @@ from pathlib import Path
 from calib_capture.axera import AX_FORMAT_YUV420_SEMIPLANAR, GrayPair
 from calib_capture.config import build_capture_config
 from calib_capture.dataset import DatasetWriter, ImuRecord
-from calib_capture.image_io import ensure_image_support
 from calib_capture.validator import validate_dataset
 
 try:
@@ -29,15 +28,13 @@ else:
 
 @unittest.skipIf(DirectoryReader is None, READER_UNAVAILABLE)
 class KalibrReaderIntegrationTest(unittest.TestCase):
-    def _dataset(self, parent: Path, image_format: str, *, include_imu: bool):
+    def _dataset(self, parent: Path, *, include_imu: bool):
         output = parent / "capture"
         config = replace(
             build_capture_config(
                 mode="stereo-imu" if include_imu else "stereo-continuous",
                 output=str(output),
                 overrides={
-                    "image_format": image_format,
-                    "jpeg_quality": 95,
                     "imu_preroll_s": 0,
                     "imu_postroll_s": 0,
                     "left_topic": "/fixture/left",
@@ -100,10 +97,10 @@ class KalibrReaderIntegrationTest(unittest.TestCase):
             writer._close_streams()
         return path, config, pairs, records
 
-    def _check_reader(self, image_format: str, *, include_imu: bool):
+    def _check_reader(self, *, include_imu: bool):
         with tempfile.TemporaryDirectory() as temporary:
             path, config, pairs, records = self._dataset(
-                Path(temporary), image_format, include_imu=include_imu)
+                Path(temporary), include_imu=include_imu)
             manifest = json.loads((path / "dataset.yaml").read_text(encoding="utf-8"))
             self.assertEqual(manifest["schema_version"], "1.0.0")
             self.assertEqual(manifest["type"], "kalibr_directory_dataset")
@@ -135,12 +132,7 @@ class KalibrReaderIntegrationTest(unittest.TestCase):
                         self.assertEqual(str(image.image.dtype), "uint8")
                         actual = image.image.tobytes()
                         expected = getattr(pair, f"{side}_pixels")
-                        if image_format == "bmp":
-                            self.assertEqual(actual, expected)
-                        else:
-                            # JPEG preserves dimensions/stream semantics, not exact pixels.
-                            self.assertLessEqual(
-                                max(abs(a - b) for a, b in zip(actual, expected)), 5)
+                        self.assertEqual(actual, expected)
             if records:
                 actual_imu = reader.read_imu('imu0')
                 self.assertEqual(len(actual_imu), len(records))
@@ -158,17 +150,10 @@ class KalibrReaderIntegrationTest(unittest.TestCase):
                 self.assertFalse((path / "imu").exists())
 
     def test_bmp_stereo_imu_custom_topics_and_original_values(self):
-        self._check_reader("bmp", include_imu=True)
+        self._check_reader(include_imu=True)
 
     def test_bmp_stereo_has_no_imu_topic(self):
-        self._check_reader("bmp", include_imu=False)
-
-    def test_jpeg95_stereo_imu_is_decodable(self):
-        try:
-            ensure_image_support("jpeg")
-        except RuntimeError as error:
-            self.skipTest(f"optional JPEG codec unavailable: {error}")
-        self._check_reader("jpeg", include_imu=True)
+        self._check_reader(include_imu=False)
 
 
 if __name__ == "__main__":
